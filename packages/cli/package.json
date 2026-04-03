@@ -1,0 +1,31 @@
+{
+  "name": "@agent-scheduler/cli",
+  "version": "0.1.0",
+  "description": "CLI for agent-scheduler",
+  "type": "module",
+  "bin": {
+    "agent-scheduler": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "@agent-scheduler/core": "*",
+    "chalk": "^5.6.2",
+    "commander": "^14.0.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

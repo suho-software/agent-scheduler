@@ -1,0 +1,29 @@
+{
+  "name": "@agent-scheduler/dashboard",
+  "version": "0.1.0",
+  "description": "Web dashboard for agent-scheduler",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently \"node --experimental-vm-modules server.js\" \"vite\"",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.2.2",
+    "@types/express": "^5.0.6",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "tailwindcss": "^4.2.2",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "@agent-scheduler/core": "^0.1.0",
+    "@vitejs/plugin-react": "^6.0.1",
+    "concurrently": "^9.2.1",
+    "express": "^5.2.1",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "recharts": "^3.8.1",
+    "vite": "^8.0.3"
+  }
+}

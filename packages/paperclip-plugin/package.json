@@ -1,0 +1,9 @@
+{
+  "name": "@agent-scheduler/paperclip-plugin",
+  "version": "0.1.0",
+  "description": "Paperclip plugin for agent-scheduler budget gating",
+  "type": "module",
+  "scripts": {
+    "build": "echo 'Plugin build — Sprint 3'"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "agent-scheduler",
+  "version": "0.1.0",
+  "description": "Paperclip plugin for agent-scheduler budget gating",
+  "hooks": [
+    {
+      "event": "agent:heartbeat:before",
+      "command": "agent-scheduler check-budget --agent-id $PAPERCLIP_AGENT_ID",
+      "description": "Block heartbeat if agent has exceeded its budget"
+    }
+  ],
+  "skills": [
+    {
+      "name": "budget-status",
+      "path": "skills/budget-status.md",
+      "description": "Check current AI API usage and budget status"
+    }
+  ]
+}

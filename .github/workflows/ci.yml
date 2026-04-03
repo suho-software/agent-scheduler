@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build packages
+        run: npm run build --workspace=packages/core --workspace=packages/cli
+
+      - name: Validate plugin.json
+        run: node -e "JSON.parse(require('fs').readFileSync('packages/paperclip-plugin/plugin.json','utf8')); console.log('plugin.json OK')"
+        working-directory: ./
+
+      - name: Smoke test CLI
+        run: |
+          node packages/cli/dist/index.js --version
+          node packages/cli/dist/index.js --help
