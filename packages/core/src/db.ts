@@ -157,6 +157,11 @@ export class AgentSchedulerDb {
     return (this.db.prepare('SELECT * FROM budgets').all() as any[]).map(rowToBudget);
   }
 
+  deleteBudget(id: string): boolean {
+    const result = this.db.prepare('DELETE FROM budgets WHERE id = ?').run(id);
+    return result.changes > 0;
+  }
+
   listUsage(opts: { limit?: number; provider?: string; agentId?: string } = {}): UsageRecord[] {
     const conditions: string[] = [];
     const params: Record<string, unknown> = {};

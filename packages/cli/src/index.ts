@@ -84,41 +84,88 @@ program
 // ─── status ──────────────────────────────────────────────────────────────────
 program
   .command('status')
-  .description('Show today / this-month usage and budget status')
+  .description('Show usage percentages against configured budgets')
   .action(() => {
     const config = loadConfig();
     const db = openDb(config.dbPath);
     const budgets = db.listBudgets();
-    const usage = db.listUsage({ limit: 10000 });
+    const usage = db.listUsage({ limit: 100000 });
     db.close();
 
-    const today = new Date();
-    const todayStr = today.toISOString().slice(0, 10);
-    const todayCost = usage
-      .filter(r => r.timestamp.toISOString().slice(0, 10) === todayStr)
-      .reduce((s, r) => s + r.costUsd, 0);
-    const monthCost = usage
-      .filter(r =>
-        r.timestamp.getFullYear() === today.getFullYear() &&
-        r.timestamp.getMonth() === today.getMonth()
-      )
-      .reduce((s, r) => s + r.costUsd, 0);
+    const now = new Date();
 
-    console.log(chalk.bold.cyan('\n  agent-scheduler status\n'));
-    console.log(`  ${chalk.bold('Today')}       $${todayCost.toFixed(4)}`);
-    console.log(`  ${chalk.bold('This month')} $${monthCost.toFixed(4)}`);
-    console.log(`  ${chalk.bold('Records')}    ${usage.length}`);
+    // ── Compute period boundaries ────────────────────────────────────────────
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const todayEnd   = new Date(todayStart.getTime() + 86_400_000);
 
-    if (budgets.length > 0) {
-      console.log(chalk.bold('\n  Budgets:\n'));
-      for (const budget of budgets) {
-        const pct = budget.limitUsd > 0 ? (monthCost / budget.limitUsd) * 100 : 0;
-        const bar = buildBar(pct);
-        const color = pct >= 100 ? chalk.red : pct >= 80 ? chalk.yellow : chalk.green;
-        console.log(`  ${chalk.bold(budget.name)} (${budget.period})`);
-        console.log(`    ${bar} ${color(pct.toFixed(1) + '%')} of $${budget.limitUsd}`);
-      }
+    const weekDay   = now.getDay();
+    const weekDiff  = weekDay === 0 ? -6 : 1 - weekDay;  // Monday = week start
+    const weekStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() + weekDiff);
+    const weekEnd   = new Date(weekStart.getTime() + 7 * 86_400_000);
+
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const monthEnd   = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+
+    const costIn = (from: Date, to: Date, model?: string) =>
+      usage
+        .filter(r => r.timestamp >= from && r.timestamp < to &&
+          (!model || r.model.startsWith(model)))
+        .reduce((s, r) => s + r.costUsd, 0);
+
+    const todayCost  = costIn(todayStart, todayEnd);
+    const weekCost   = costIn(weekStart, weekEnd);
+    const monthCost  = costIn(monthStart, monthEnd);
+    const weekSonnet = costIn(weekStart, weekEnd, 'claude-sonnet');
+
+    // ── Format helpers ───────────────────────────────────────────────────────
+    const BAR_W = 42;
+    function bar(pct: number): string {
+      const clamped = Math.min(pct / 100, 1);
+      const filled  = Math.round(clamped * BAR_W);
+      const empty   = BAR_W - filled;
+      const color   = pct >= 100 ? chalk.red : pct >= 80 ? chalk.yellow : chalk.cyan;
+      return color('█'.repeat(filled)) + chalk.gray('░'.repeat(empty));
     }
+    function pctLabel(pct: number): string {
+      const color = pct >= 100 ? chalk.red : pct >= 80 ? chalk.yellow : chalk.white;
+      return color(pct.toFixed(0) + '% used');
+    }
+    function resetLabel(d: Date): string {
+      const options: Intl.DateTimeFormatOptions = { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'Asia/Seoul', timeZoneName: 'short' };
+      return chalk.gray('Resets ' + d.toLocaleString('en-US', options).replace(':00 ', ' '));
+    }
+    function section(label: string, cost: number, limitUsd: number, resetsAt: Date): void {
+      const pct = limitUsd > 0 ? (cost / limitUsd) * 100 : 0;
+      console.log(chalk.bold(`\n  ${label}`));
+      console.log(`  ${bar(pct)}  ${pctLabel(pct)}`);
+      console.log(`  ${resetLabel(resetsAt)}   ${chalk.gray('$' + cost.toFixed(2) + ' / $' + limitUsd)}`);
+    }
+
+    // ── Find budget limits (fall back to defaults if not set) ────────────────
+    const budgetMap = Object.fromEntries(budgets.map(b => [b.id, b.limitUsd]));
+    const dailyLimit   = budgetMap['daily']         ?? budgetMap['default'] ?? 0;
+    const weeklyLimit  = budgetMap['weekly']         ?? 0;
+    const sonnetLimit  = budgetMap['weekly-sonnet']  ?? 0;
+    const monthlyLimit = budgetMap['monthly']        ?? 0;
+
+    console.log(chalk.bold.cyan('\n  agent-scheduler /usage\n'));
+    console.log(chalk.gray('  ─'.repeat(26)));
+
+    if (dailyLimit > 0)   section('Today',                        todayCost,  dailyLimit,   todayEnd);
+    if (weeklyLimit > 0)  section('Current week (all models)',     weekCost,   weeklyLimit,  weekEnd);
+    if (sonnetLimit > 0)  section('Current week (Sonnet only)',    weekSonnet, sonnetLimit,  weekEnd);
+    if (monthlyLimit > 0) section('Current month',                 monthCost,  monthlyLimit, monthEnd);
+
+    if (dailyLimit === 0 && weeklyLimit === 0 && monthlyLimit === 0) {
+      console.log(chalk.yellow('\n  No budgets configured — run: agent-scheduler budget set <name> <usd>'));
+      console.log(chalk.gray('  Suggested: agent-scheduler budget set weekly 150 --period weekly'));
+      console.log(chalk.gray('             agent-scheduler budget set monthly 500 --period monthly\n'));
+      // Show raw summary as fallback
+      console.log(`  Today       $${todayCost.toFixed(4)}`);
+      console.log(`  This week   $${weekCost.toFixed(4)}`);
+      console.log(`  This month  $${monthCost.toFixed(4)}`);
+    }
+
     console.log();
   });
 
@@ -152,6 +199,21 @@ budgetCmd
     db.upsertBudget({ id: name, name, limitUsd, period, alertThreshold, action });
     db.close();
     console.log(chalk.green(`\n  ✓ Budget '${name}': $${limitUsd}/${period} (action: ${action})\n`));
+  });
+
+budgetCmd
+  .command('delete <id>')
+  .description('Delete a budget by id')
+  .action((id: string) => {
+    const config = loadConfig();
+    const db = openDb(config.dbPath);
+    const deleted = db.deleteBudget(id);
+    db.close();
+    if (deleted) {
+      console.log(chalk.green(`\n  ✓ Budget '${id}' deleted.\n`));
+    } else {
+      console.log(chalk.yellow(`\n  Budget '${id}' not found.\n`));
+    }
   });
 
 budgetCmd
