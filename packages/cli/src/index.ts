@@ -366,4 +366,110 @@ program
     console.log();
   });
 
+// ─── report ───────────────────────────────────────────────────────────────────
+program
+  .command('report')
+  .description('Show weekly usage report with percentage bars (like claude /usage)')
+  .option('--days <days>', 'Number of days to cover (default 7)', '7')
+  .option('--weekly-limit <tokens>', 'Weekly token limit to measure against (default: Claude Max 5x ≈ 288000000)')
+  .option('--sonnet-limit <tokens>', 'Sonnet-specific weekly token limit (default: 1008000000)')
+  .option('--plain', 'Output plain text without ANSI colors (for email)', false)
+  .action((opts: { days: string; weeklyLimit?: string; sonnetLimit?: string; plain: boolean }) => {
+    const config = loadConfig();
+    const db = openDb(config.dbPath);
+
+    const days = parseInt(opts.days, 10);
+    // Defaults back-calculated from Claude Max 5x plan observed via /usage:
+    // all models 84% = 242M → limit ≈ 288M; Sonnet 24% = 242M → limit ≈ 1B
+    const weeklyLimitAll = parseInt(opts.weeklyLimit ?? '288000000', 10);
+    const weeklyLimitSonnet = parseInt(opts.sonnetLimit ?? '1008000000', 10);
+
+    const now = new Date();
+    const periodStart = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+
+    // Get all records with metadata for the period
+    const rows = (db as any)['db'].prepare(
+      `SELECT model, input_tokens, output_tokens, cost_usd, metadata, timestamp
+       FROM usage_records WHERE timestamp >= ? ORDER BY timestamp ASC`
+    ).all(periodStart.toISOString()) as Array<{
+      model: string; input_tokens: number; output_tokens: number;
+      cost_usd: number; metadata: string | null; timestamp: string;
+    }>;
+
+    db.close();
+
+    // Aggregate total tokens (including cache) per model
+    interface ModelStats {
+      input: number; output: number; cacheRead: number; cacheWrite: number; cost: number; count: number;
+    }
+    const byModel = new Map<string, ModelStats>();
+    let totalCost = 0;
+
+    for (const r of rows) {
+      const meta = r.metadata ? JSON.parse(r.metadata) as { cacheRead?: number; cacheWrite?: number } : {};
+      const total: ModelStats = byModel.get(r.model) ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, count: 0 };
+      total.input += r.input_tokens;
+      total.output += r.output_tokens;
+      total.cacheRead += meta.cacheRead ?? 0;
+      total.cacheWrite += meta.cacheWrite ?? 0;
+      total.cost += r.cost_usd;
+      total.count += 1;
+      byModel.set(r.model, total);
+      totalCost += r.cost_usd;
+    }
+
+    const allTotal = [...byModel.values()].reduce(
+      (s, m) => ({ tokens: s.tokens + m.input + m.output + m.cacheRead + m.cacheWrite }), { tokens: 0 }
+    ).tokens;
+
+    const sonnetTotal = [...byModel.entries()]
+      .filter(([k]) => k.toLowerCase().includes('sonnet'))
+      .reduce((s, [, m]) => s + m.input + m.output + m.cacheRead + m.cacheWrite, 0);
+
+    const pctAll = weeklyLimitAll > 0 ? (allTotal / weeklyLimitAll) * 100 : 0;
+    const pctSonnet = weeklyLimitSonnet > 0 ? (sonnetTotal / weeklyLimitSonnet) * 100 : 0;
+
+    const barWidth = 40;
+    function bar(pct: number): string {
+      const filled = Math.min(Math.round((pct / 100) * barWidth), barWidth);
+      const empty = barWidth - filled;
+      if (opts.plain) return '█'.repeat(filled) + '░'.repeat(empty);
+      const color = pct >= 100 ? chalk.red : pct >= 80 ? chalk.yellow : chalk.green;
+      return color('█'.repeat(filled)) + chalk.gray('░'.repeat(empty));
+    }
+
+    function pctColor(pct: number, text: string): string {
+      if (opts.plain) return text;
+      return pct >= 100 ? chalk.red(text) : pct >= 80 ? chalk.yellow(text) : chalk.green(text);
+    }
+
+    const label = opts.plain ? '' : chalk.bold.cyan;
+    const gray = opts.plain ? (s: string) => s : chalk.gray;
+
+    if (!opts.plain) console.log(chalk.bold.cyan('\n  agent-scheduler report\n'));
+    else console.log('\n  agent-scheduler report\n');
+
+    console.log(`  ${opts.plain ? '' : chalk.bold('Period')}${opts.plain ? 'Period: ' : ''}     last ${days} days  (${periodStart.toISOString().slice(0,10)} → ${now.toISOString().slice(0,10)})`);
+    console.log(`  ${opts.plain ? 'Records: ' : chalk.bold('Records')}    ${rows.length.toLocaleString()}`);
+    console.log(`  ${opts.plain ? 'Cost USD: ' : chalk.bold('Cost USD')}   $${totalCost.toFixed(4)}\n`);
+
+    console.log(`  ${opts.plain ? 'All models (7d):' : chalk.bold('All models (7d):')}  ${allTotal.toLocaleString()} tokens`);
+    console.log(`  ${bar(pctAll)}  ${pctColor(pctAll, pctAll.toFixed(1) + '% used')}`);
+    console.log(gray(`  Limit: ${weeklyLimitAll.toLocaleString()} tokens  (--weekly-limit to adjust)\n`));
+
+    console.log(`  ${opts.plain ? 'Sonnet only (7d):' : chalk.bold('Sonnet only (7d):')} ${sonnetTotal.toLocaleString()} tokens`);
+    console.log(`  ${bar(pctSonnet)}  ${pctColor(pctSonnet, pctSonnet.toFixed(1) + '% used')}`);
+    console.log(gray(`  Limit: ${weeklyLimitSonnet.toLocaleString()} tokens  (--sonnet-limit to adjust)\n`));
+
+    if (byModel.size > 0) {
+      console.log(opts.plain ? '  By model:' : chalk.bold('  By model:'));
+      for (const [model, m] of [...byModel.entries()].sort((a, b) => b[1].cost - a[1].cost)) {
+        const t = m.input + m.output + m.cacheRead + m.cacheWrite;
+        const shortModel = model.length > 30 ? model.slice(0, 30) + '…' : model;
+        console.log(gray(`    ${shortModel.padEnd(32)} ${t.toLocaleString().padStart(12)} tokens   $${m.cost.toFixed(4)}`));
+      }
+      console.log();
+    }
+  });
+
 program.parse();
