@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 import { UsageRecord, Budget, BudgetStatus } from './types.js';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 export function openDb(path: string = '.agent-scheduler.db'): AgentSchedulerDb {
   const db = new Database(path);
@@ -15,35 +15,45 @@ function migrate(db: Database.Database): void {
   const version: number = (db.pragma('user_version', { simple: true }) as number);
   if (version >= SCHEMA_VERSION) return;
 
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS usage_records (
-      id          TEXT PRIMARY KEY,
-      timestamp   TEXT NOT NULL,
-      provider    TEXT NOT NULL,
-      model       TEXT NOT NULL,
-      input_tokens  INTEGER NOT NULL DEFAULT 0,
-      output_tokens INTEGER NOT NULL DEFAULT 0,
-      cost_usd    REAL NOT NULL DEFAULT 0,
-      agent_id    TEXT,
-      task_id     TEXT,
-      metadata    TEXT
-    );
+  if (version < 1) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS usage_records (
+        id          TEXT PRIMARY KEY,
+        timestamp   TEXT NOT NULL,
+        provider    TEXT NOT NULL,
+        model       TEXT NOT NULL,
+        input_tokens  INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        cost_usd    REAL NOT NULL DEFAULT 0,
+        agent_id    TEXT,
+        task_id     TEXT,
+        metadata    TEXT
+      );
 
-    CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_records(timestamp);
-    CREATE INDEX IF NOT EXISTS idx_usage_provider  ON usage_records(provider);
-    CREATE INDEX IF NOT EXISTS idx_usage_agent_id  ON usage_records(agent_id);
+      CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_records(timestamp);
+      CREATE INDEX IF NOT EXISTS idx_usage_provider  ON usage_records(provider);
+      CREATE INDEX IF NOT EXISTS idx_usage_agent_id  ON usage_records(agent_id);
 
-    CREATE TABLE IF NOT EXISTS budgets (
-      id               TEXT PRIMARY KEY,
-      name             TEXT NOT NULL,
-      limit_usd        REAL NOT NULL,
-      period           TEXT NOT NULL,
-      alert_threshold  REAL NOT NULL DEFAULT 0.8,
-      action           TEXT NOT NULL DEFAULT 'alert'
-    );
+      CREATE TABLE IF NOT EXISTS budgets (
+        id               TEXT PRIMARY KEY,
+        name             TEXT NOT NULL,
+        limit_usd        REAL NOT NULL,
+        period           TEXT NOT NULL,
+        alert_threshold  REAL NOT NULL DEFAULT 0.8,
+        action           TEXT NOT NULL DEFAULT 'alert'
+      );
+    `);
+  }
 
-    PRAGMA user_version = ${SCHEMA_VERSION};
-  `);
+  if (version < 2) {
+    db.exec(`
+      ALTER TABLE usage_records ADD COLUMN source_id TEXT;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_source_id
+        ON usage_records(source_id) WHERE source_id IS NOT NULL;
+    `);
+  }
+
+  db.pragma(`user_version = ${SCHEMA_VERSION}`);
 }
 
 export class AgentSchedulerDb {
@@ -70,6 +80,36 @@ export class AgentSchedulerDb {
       metadata: record.metadata ? JSON.stringify(record.metadata) : null,
     });
     return { ...record, id, timestamp };
+  }
+
+  /**
+   * Insert a usage record idempotently using sourceId as the dedup key.
+   * Returns { inserted: true } if written, { inserted: false } if already present.
+   */
+  insertUsageFromSource(
+    record: Omit<UsageRecord, 'id' | 'timestamp'> & { timestamp: Date },
+    sourceId: string,
+  ): { inserted: boolean } {
+    const id = randomUUID();
+    const result = this.db.prepare(`
+      INSERT OR IGNORE INTO usage_records
+        (id, timestamp, provider, model, input_tokens, output_tokens, cost_usd, agent_id, task_id, metadata, source_id)
+      VALUES
+        (@id, @timestamp, @provider, @model, @inputTokens, @outputTokens, @costUsd, @agentId, @taskId, @metadata, @sourceId)
+    `).run({
+      id,
+      timestamp: record.timestamp.toISOString(),
+      provider: record.provider,
+      model: record.model,
+      inputTokens: record.inputTokens,
+      outputTokens: record.outputTokens,
+      costUsd: record.costUsd,
+      agentId: record.agentId ?? null,
+      taskId: record.taskId ?? null,
+      metadata: record.metadata ? JSON.stringify(record.metadata) : null,
+      sourceId,
+    });
+    return { inserted: result.changes > 0 };
   }
 
   upsertBudget(budget: Omit<Budget, 'id'> & { id?: string }): Budget {

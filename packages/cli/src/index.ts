@@ -2,10 +2,11 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import { createInterface } from 'node:readline/promises';
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, createReadStream } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { openDb } from '@agent-scheduler/core';
+import { createInterface as createLineInterface } from 'node:readline';
+import { openDb, calcCostUsdWithCache } from '@agent-scheduler/core';
 
 const CONFIG_PATH = join(homedir(), '.agent-scheduler.json');
 
@@ -258,6 +259,111 @@ program
       process.exit(1);
     }
     process.exit(0);
+  });
+
+// ─── sync ─────────────────────────────────────────────────────────────────────
+program
+  .command('sync')
+  .description('Sync usage data from external sources into the local DB')
+  .argument('[source]', 'Source to sync from: claude-code', 'claude-code')
+  .option('--projects-dir <dir>', 'Claude Code projects directory',
+    join(homedir(), '.claude', 'projects'))
+  .option('--dry-run', 'Print records without writing them', false)
+  .action(async (source: string, opts: { projectsDir: string; dryRun: boolean }) => {
+    if (source !== 'claude-code') {
+      console.error(chalk.red(`  Unknown source '${source}'. Supported: claude-code`));
+      process.exit(1);
+    }
+
+    const config = loadConfig();
+    const db = opts.dryRun ? null : openDb(config.dbPath);
+
+    // Collect all .jsonl files recursively under projects dir
+    const jsonlFiles: string[] = [];
+    function collectJsonl(dir: string): void {
+      let entries: string[];
+      try { entries = readdirSync(dir); } catch { return; }
+      for (const entry of entries) {
+        const full = join(dir, entry);
+        try {
+          const st = statSync(full);
+          if (st.isDirectory()) {
+            collectJsonl(full);
+          } else if (entry.endsWith('.jsonl')) {
+            jsonlFiles.push(full);
+          }
+        } catch { /* skip unreadable */ }
+      }
+    }
+    collectJsonl(opts.projectsDir);
+
+    console.log(chalk.bold.cyan('\n  agent-scheduler sync claude-code\n'));
+    console.log(chalk.gray(`  Projects dir: ${opts.projectsDir}`));
+    console.log(chalk.gray(`  JSONL files:  ${jsonlFiles.length}`));
+    if (opts.dryRun) console.log(chalk.yellow('  DRY RUN — no writes\n'));
+    else console.log();
+
+    let totalInserted = 0;
+    let totalSkipped = 0;
+    let totalErrors = 0;
+
+    for (const file of jsonlFiles) {
+      await new Promise<void>((resolve) => {
+        const rl = createLineInterface({ input: createReadStream(file), crlfDelay: Infinity });
+        rl.on('line', (line) => {
+          const trimmed = line.trim();
+          if (!trimmed) return;
+          let entry: any;
+          try { entry = JSON.parse(trimmed); } catch { totalErrors++; return; }
+
+          // Only assistant messages with usage data
+          const msg = entry.message;
+          if (!msg || msg.role !== 'assistant' || !msg.usage) return;
+          const sourceId: string | undefined = msg.id;
+          if (!sourceId) return;
+
+          const model: string = msg.model ?? 'unknown';
+          const usage = msg.usage as {
+            input_tokens?: number;
+            output_tokens?: number;
+            cache_read_input_tokens?: number;
+            cache_creation_input_tokens?: number;
+          };
+          const inputTokens = usage.input_tokens ?? 0;
+          const outputTokens = usage.output_tokens ?? 0;
+          const cacheRead = usage.cache_read_input_tokens ?? 0;
+          const cacheWrite = usage.cache_creation_input_tokens ?? 0;
+          const costUsd = calcCostUsdWithCache(model, inputTokens, outputTokens, cacheRead, cacheWrite);
+
+          const timestamp = entry.timestamp ? new Date(entry.timestamp as string) : new Date();
+
+          if (opts.dryRun) {
+            const ts = timestamp.toISOString().replace('T', ' ').slice(0, 19);
+            console.log(chalk.gray(`  [dry] ${ts}  ${model.padEnd(24)}  in=${inputTokens}  out=${outputTokens}  $${costUsd.toFixed(6)}`));
+            totalInserted++;
+            return;
+          }
+
+          const result = db!.insertUsageFromSource(
+            { provider: 'anthropic', model, inputTokens, outputTokens, costUsd, timestamp,
+              metadata: { cacheRead, cacheWrite, sessionId: entry.sessionId, sourceFile: file } },
+            sourceId,
+          );
+          if (result.inserted) totalInserted++;
+          else totalSkipped++;
+        });
+        rl.on('close', resolve);
+        rl.on('error', () => { totalErrors++; resolve(); });
+      });
+    }
+
+    db?.close();
+
+    console.log(chalk.bold('\n  Results:'));
+    console.log(chalk.green(`  ✓ Inserted: ${totalInserted}`));
+    console.log(chalk.gray(`  – Skipped (already synced): ${totalSkipped}`));
+    if (totalErrors > 0) console.log(chalk.yellow(`  ⚠ Parse errors: ${totalErrors}`));
+    console.log();
   });
 
 program.parse();

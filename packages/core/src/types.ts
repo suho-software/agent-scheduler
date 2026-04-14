@@ -60,3 +60,24 @@ export function calcCostUsd(
   if (!price) return 0;
   return (inputTokens * price.input + outputTokens * price.output) / 1_000_000;
 }
+
+/**
+ * Calculate cost for Claude Code session data, which includes cache tokens.
+ * Cache read tokens cost 10% of regular input; cache write tokens cost 125%.
+ */
+export function calcCostUsdWithCache(
+  model: string,
+  inputTokens: number,
+  outputTokens: number,
+  cacheReadTokens: number,
+  cacheWriteTokens: number,
+): number {
+  const price = PRICING[model];
+  if (!price) return 0;
+  return (
+    inputTokens * price.input +
+    outputTokens * price.output +
+    cacheReadTokens * price.input * 0.1 +
+    cacheWriteTokens * price.input * 1.25
+  ) / 1_000_000;
+}
