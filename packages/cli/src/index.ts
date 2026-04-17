@@ -325,6 +325,24 @@ const usageCmd = program
   });
 
 usageCmd
+  .command('quota-json')
+  .description('Output current session and weekly quota as JSON (for scripting/throttle checks)')
+  .action(() => {
+    const config = loadConfig();
+    const db = openDb(config.dbPath);
+    const sessions = db.getSessionStats(config.plan);
+    db.close();
+
+    console.log(JSON.stringify({
+      currentSessionPct: Math.round(sessions.currentSession.percent * 100 * 10) / 10,
+      weeklySessionsPct: Math.round(sessions.weeklySessions.percent * 100 * 10) / 10,
+      minutesUntilReset: sessions.currentSession.minutesUntilReset,
+      weeklySessions: sessions.weeklySessions.count,
+      weeklySessionQuota: sessions.weeklySessions.quota,
+    }));
+  });
+
+usageCmd
   .command('list')
   .description('List usage records')
   .option('--provider <provider>', 'Filter by provider (anthropic|openai|gemini)')
