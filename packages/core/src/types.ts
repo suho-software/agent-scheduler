@@ -42,6 +42,7 @@ export interface BudgetStatus {
 
 // Token pricing per 1M tokens (USD)
 export const PRICING: Record<string, { input: number; output: number }> = {
+  'claude-opus-4-6': { input: 15, output: 75 },
   'claude-opus-4': { input: 15, output: 75 },
   'claude-sonnet-4-6': { input: 3, output: 15 },
   'claude-haiku-4-5': { input: 0.8, output: 4 },
@@ -51,12 +52,22 @@ export const PRICING: Record<string, { input: number; output: number }> = {
   'gemini-1.5-flash': { input: 0.075, output: 0.3 },
 };
 
+/**
+ * Look up pricing for a model, using prefix matching to handle versioned names
+ * (e.g. "claude-haiku-4-5-20251001" → "claude-haiku-4-5").
+ */
+function getPricing(model: string): { input: number; output: number } | undefined {
+  if (PRICING[model]) return PRICING[model];
+  const key = Object.keys(PRICING).find(k => model.startsWith(k));
+  return key ? PRICING[key] : undefined;
+}
+
 export function calcCostUsd(
   model: string,
   inputTokens: number,
   outputTokens: number,
 ): number {
-  const price = PRICING[model];
+  const price = getPricing(model);
   if (!price) return 0;
   return (inputTokens * price.input + outputTokens * price.output) / 1_000_000;
 }
@@ -72,7 +83,7 @@ export function calcCostUsdWithCache(
   cacheReadTokens: number,
   cacheWriteTokens: number,
 ): number {
-  const price = PRICING[model];
+  const price = getPricing(model);
   if (!price) return 0;
   return (
     inputTokens * price.input +
