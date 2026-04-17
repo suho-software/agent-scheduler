@@ -1,6 +1,9 @@
 import Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
-import { UsageRecord, Budget, BudgetStatus, TokenQuotaStatus, ClaudePlan, CLAUDE_PLAN_LIMITS } from './types.js';
+import { readFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
+import { UsageRecord, Budget, BudgetStatus, TokenQuotaStatus, SessionStats, ClaudePlan, CLAUDE_PLAN_LIMITS, CLAUDE_SESSION_LIMITS } from './types.js';
 
 const SCHEMA_VERSION = 3;
 
@@ -219,6 +222,83 @@ export class AgentSchedulerDb {
       sonnetLimitTokens: limits.weeklySonnet,
       allPercent: limits.weeklyAll > 0 ? allTokens / limits.weeklyAll : 0,
       sonnetPercent: limits.weeklySonnet > 0 ? sonnetTokens / limits.weeklySonnet : 0,
+    };
+  }
+
+  /**
+   * Session-level usage: current 5-hour rolling window (from DB) +
+   * weekly session count (from ~/.claude/stats-cache.json).
+   */
+  getSessionStats(plan: ClaudePlan = 'max-5x'): SessionStats {
+    const limits = CLAUDE_SESSION_LIMITS[plan];
+    const now = new Date();
+    const fiveHourStart = new Date(now.getTime() - 5 * 60 * 60 * 1000);
+
+    // Current session token usage (5-hour rolling window)
+    const fiveHourRow = this.db.prepare(
+      'SELECT COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens), 0) AS tokens' +
+      ' FROM usage_records WHERE timestamp >= ? AND provider = \'anthropic\''
+    ).get(fiveHourStart.toISOString()) as { tokens: number };
+
+    const earliestRow = this.db.prepare(
+      'SELECT MIN(timestamp) AS earliest FROM usage_records WHERE timestamp >= ? AND provider = \'anthropic\''
+    ).get(fiveHourStart.toISOString()) as { earliest: string | null };
+
+    let minutesUntilReset: number | null = null;
+    if (earliestRow.earliest) {
+      const resetAt = new Date(new Date(earliestRow.earliest).getTime() + 5 * 60 * 60 * 1000);
+      minutesUntilReset = Math.max(0, Math.round((resetAt.getTime() - now.getTime()) / 60_000));
+    }
+
+    // Weekly session count from ~/.claude/stats-cache.json
+    const statsPath = join(homedir(), '.claude', 'stats-cache.json');
+    let weeklyCount = 0;
+    let sessionsHitLimit = 0;
+
+    if (existsSync(statsPath)) {
+      try {
+        const cache = JSON.parse(readFileSync(statsPath, 'utf-8')) as {
+          dailyActivity?: { date: string; sessionCount: number }[];
+          dailyModelTokens?: { date: string; tokensByModel: Record<string, number> }[];
+        };
+
+        const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+        for (const entry of cache.dailyActivity ?? []) {
+          if (new Date(entry.date + 'T00:00:00Z') >= sevenDaysAgo) {
+            weeklyCount += entry.sessionCount;
+          }
+        }
+
+        const tokensByDate: Record<string, number> = {};
+        for (const entry of cache.dailyModelTokens ?? []) {
+          if (new Date(entry.date + 'T00:00:00Z') >= sevenDaysAgo) {
+            const dayTotal = Object.values(entry.tokensByModel).reduce((s, v) => s + v, 0);
+            tokensByDate[entry.date] = (tokensByDate[entry.date] ?? 0) + dayTotal;
+          }
+        }
+        for (const tokens of Object.values(tokensByDate)) {
+          if (tokens >= limits.fiveHourTokens) sessionsHitLimit++;
+        }
+      } catch {
+        // stats-cache.json unreadable — return zero counts
+      }
+    }
+
+    return {
+      currentSession: {
+        tokens: fiveHourRow.tokens,
+        limitTokens: limits.fiveHourTokens,
+        percent: limits.fiveHourTokens > 0 ? fiveHourRow.tokens / limits.fiveHourTokens : 0,
+        windowStart: fiveHourStart,
+        minutesUntilReset,
+      },
+      weeklySessions: {
+        count: weeklyCount,
+        quota: limits.weeklySessionQuota,
+        percent: limits.weeklySessionQuota > 0 ? weeklyCount / limits.weeklySessionQuota : 0,
+        sessionsHitLimit,
+      },
     };
   }
 

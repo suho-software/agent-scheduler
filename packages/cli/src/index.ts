@@ -263,6 +263,7 @@ const usageCmd = program
     const config = loadConfig();
     const db = openDb(config.dbPath);
     const quota = db.getTokenQuotaStatus(config.plan);
+    const sessions = db.getSessionStats(config.plan);
     db.close();
 
     const BAR_W = 42;
@@ -293,6 +294,23 @@ const usageCmd = program
     console.log(chalk.gray(`  Plan: ${quota.plan}   Week: ${quota.periodStart.toISOString().slice(0,10)} → ${quota.periodEnd.toISOString().slice(0,10)}`));
     console.log(chalk.gray(`  Resets ${resetDate}\n`));
 
+    // ── Current session (5-hour rolling window) ──────────────────────────────
+    const cs = sessions.currentSession;
+    const resetLabel = cs.minutesUntilReset !== null
+      ? chalk.gray(` · reset in ${cs.minutesUntilReset}m`)
+      : chalk.gray(' · no activity');
+    console.log(chalk.bold(`  Current session`) + chalk.gray(`  (5-hr window since ${cs.windowStart.toISOString().replace('T',' ').slice(0,16)} UTC)`) + resetLabel);
+    console.log(`  ${bar(cs.percent)}  ${pctLabel(cs.percent)}`);
+    console.log(chalk.gray(`  ${fmtTokens(cs.tokens)} / ${fmtTokens(cs.limitTokens)} tokens\n`));
+
+    // ── Weekly sessions ──────────────────────────────────────────────────────
+    const ws = sessions.weeklySessions;
+    const hitLabel = ws.sessionsHitLimit > 0 ? chalk.gray(`  (${ws.sessionsHitLimit} hit token limit)`) : '';
+    console.log(chalk.bold('  Weekly sessions') + chalk.gray('  (last 7 days)'));
+    console.log(`  ${bar(ws.percent)}  ${pctLabel(ws.percent)}${hitLabel}`);
+    console.log(chalk.gray(`  ${ws.count} / ${ws.quota} sessions\n`));
+
+    // ── Weekly token window ──────────────────────────────────────────────────
     console.log(chalk.bold('  All models (this week)'));
     console.log(`  ${bar(quota.allPercent)}  ${pctLabel(quota.allPercent)}`);
     console.log(chalk.gray(`  ${fmtTokens(quota.allTokens)} / ${fmtTokens(quota.allLimitTokens)} tokens\n`));

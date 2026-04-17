@@ -63,6 +63,32 @@ export interface TokenQuotaStatus {
   sonnetPercent: number;
 }
 
+/** Per-session (5-hour window) token limits per plan. */
+export const CLAUDE_SESSION_LIMITS: Record<ClaudePlan, { fiveHourTokens: number; weeklySessionQuota: number }> = {
+  'pro':     { fiveHourTokens:  1_000_000, weeklySessionQuota: 50 },
+  'max-5x':  { fiveHourTokens:  5_000_000, weeklySessionQuota: 57 },
+  'max-20x': { fiveHourTokens: 20_000_000, weeklySessionQuota: 57 },
+};
+
+/** Session-level usage metrics (current 5-hr window + weekly session count). */
+export interface SessionStats {
+  currentSession: {
+    tokens: number;
+    limitTokens: number;
+    percent: number;
+    windowStart: Date;
+    /** Minutes until the oldest record in the 5-hr window expires. Null if no records. */
+    minutesUntilReset: number | null;
+  };
+  weeklySessions: {
+    count: number;
+    quota: number;
+    percent: number;
+    /** Sessions in the last 7 days that exhausted the token limit. */
+    sessionsHitLimit: number;
+  };
+}
+
 // Token pricing per 1M tokens (USD)
 export const PRICING: Record<string, { input: number; output: number }> = {
   'claude-opus-4-6': { input: 15, output: 75 },
