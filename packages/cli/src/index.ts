@@ -6,20 +6,26 @@ import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, createR
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface as createLineInterface } from 'node:readline';
-import { openDb, calcCostUsdWithCache } from '@agent-scheduler/core';
+import { openDb, calcCostUsdWithCache, CLAUDE_PLAN_LIMITS, ClaudePlan } from '@agent-scheduler/core';
 
 const CONFIG_PATH = join(homedir(), '.agent-scheduler.json');
 
 interface Config {
   dbPath: string;
   defaultBudgetUsd: number;
+  plan: ClaudePlan;
 }
 
 function loadConfig(): Config {
   if (existsSync(CONFIG_PATH)) {
-    return JSON.parse(readFileSync(CONFIG_PATH, 'utf-8')) as Config;
+    const raw = JSON.parse(readFileSync(CONFIG_PATH, 'utf-8')) as Partial<Config>;
+    return {
+      dbPath: raw.dbPath ?? join(homedir(), '.agent-scheduler.db'),
+      defaultBudgetUsd: raw.defaultBudgetUsd ?? 10,
+      plan: (raw.plan as ClaudePlan) ?? 'max-5x',
+    };
   }
-  return { dbPath: join(homedir(), '.agent-scheduler.db'), defaultBudgetUsd: 10 };
+  return { dbPath: join(homedir(), '.agent-scheduler.db'), defaultBudgetUsd: 10, plan: 'max-5x' };
 }
 
 function saveConfig(config: Config): void {
@@ -56,11 +62,19 @@ program
     const budgetStr = await rl.question(
       chalk.gray(`  Default monthly budget USD [${existing.defaultBudgetUsd}]: `)
     );
+    const planStr = await rl.question(
+      chalk.gray(`  Claude plan (pro / max-5x / max-20x) [${existing.plan}]: `)
+    );
     rl.close();
+
+    const planInput = planStr.trim() || existing.plan;
+    const validPlans: ClaudePlan[] = ['pro', 'max-5x', 'max-20x'];
+    const plan: ClaudePlan = (validPlans.includes(planInput as ClaudePlan) ? planInput : existing.plan) as ClaudePlan;
 
     const config: Config = {
       dbPath: dbPath.trim() || existing.dbPath,
       defaultBudgetUsd: budgetStr.trim() ? parseFloat(budgetStr) : existing.defaultBudgetUsd,
+      plan,
     };
 
     saveConfig(config);
@@ -78,7 +92,8 @@ program
 
     console.log(chalk.green('\n  ✓ Initialized!'));
     console.log(chalk.gray(`    DB:     ${config.dbPath}`));
-    console.log(chalk.gray(`    Budget: $${config.defaultBudgetUsd}/month\n`));
+    console.log(chalk.gray(`    Budget: $${config.defaultBudgetUsd}/month`));
+    console.log(chalk.gray(`    Plan:   ${config.plan}\n`));
   });
 
 // ─── status ──────────────────────────────────────────────────────────────────
@@ -240,10 +255,56 @@ budgetCmd
     console.log();
   });
 
-// ─── usage ───────────────────────────────────────────────────────────────────
+// ─── usage (top-level: claude /usage style quota view) ───────────────────────
 const usageCmd = program
   .command('usage')
-  .description('Usage record commands');
+  .description('Show token quota status (claude /usage style) — or use subcommands')
+  .action(() => {
+    const config = loadConfig();
+    const db = openDb(config.dbPath);
+    const quota = db.getTokenQuotaStatus(config.plan);
+    db.close();
+
+    const BAR_W = 42;
+    function bar(pct: number): string {
+      const clamped = Math.min(pct, 1);
+      const filled  = Math.round(clamped * BAR_W);
+      const empty   = BAR_W - filled;
+      const color   = pct >= 1 ? chalk.red : pct >= 0.8 ? chalk.yellow : chalk.cyan;
+      return color('█'.repeat(filled)) + chalk.gray('░'.repeat(empty));
+    }
+    function pctLabel(pct: number): string {
+      const color = pct >= 1 ? chalk.red : pct >= 0.8 ? chalk.yellow : chalk.white;
+      return color((pct * 100).toFixed(1) + '% used');
+    }
+    function fmtTokens(n: number): string {
+      if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(2) + 'B';
+      if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+      if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
+      return String(n);
+    }
+    const resetDate = quota.periodEnd.toLocaleString('en-US', {
+      month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+      timeZone: 'Asia/Seoul', timeZoneName: 'short',
+    });
+
+    console.log(chalk.bold.cyan('\n  agent-scheduler usage\n'));
+    console.log(chalk.gray('  ─'.repeat(26)));
+    console.log(chalk.gray(`  Plan: ${quota.plan}   Week: ${quota.periodStart.toISOString().slice(0,10)} → ${quota.periodEnd.toISOString().slice(0,10)}`));
+    console.log(chalk.gray(`  Resets ${resetDate}\n`));
+
+    console.log(chalk.bold('  All models (this week)'));
+    console.log(`  ${bar(quota.allPercent)}  ${pctLabel(quota.allPercent)}`);
+    console.log(chalk.gray(`  ${fmtTokens(quota.allTokens)} / ${fmtTokens(quota.allLimitTokens)} tokens\n`));
+
+    console.log(chalk.bold('  Sonnet (this week)'));
+    console.log(`  ${bar(quota.sonnetPercent)}  ${pctLabel(quota.sonnetPercent)}`);
+    console.log(chalk.gray(`  ${fmtTokens(quota.sonnetTokens)} / ${fmtTokens(quota.sonnetLimitTokens)} tokens\n`));
+
+    const planLimits = CLAUDE_PLAN_LIMITS[config.plan];
+    console.log(chalk.gray(`  Plan limits: all=${fmtTokens(planLimits.weeklyAll)}/wk  sonnet=${fmtTokens(planLimits.weeklySonnet)}/wk`));
+    console.log(chalk.gray('  Adjust plan: agent-scheduler init  (or edit ~/.agent-scheduler.json)\n'));
+  });
 
 usageCmd
   .command('list')
@@ -265,19 +326,20 @@ usageCmd
     }
 
     console.log(chalk.bold.cyan('\n  Usage records:\n'));
-    const header = ['Time'.padEnd(20), 'Provider'.padEnd(12), 'Model'.padEnd(24), 'In'.padEnd(8), 'Out'.padEnd(8), 'Cost USD'];
+    const header = ['Time'.padEnd(20), 'Model'.padEnd(28), 'In'.padEnd(8), 'Out'.padEnd(8), 'CacheR'.padEnd(10), 'CacheW'.padEnd(10), 'Cost USD'];
     console.log(chalk.gray('  ' + header.join('  ')));
-    console.log(chalk.gray('  ' + '─'.repeat(85)));
+    console.log(chalk.gray('  ' + '─'.repeat(100)));
 
     for (const r of records) {
       const ts = r.timestamp.toISOString().replace('T', ' ').slice(0, 19);
       console.log(
         '  ' + [
           ts.padEnd(20),
-          r.provider.padEnd(12),
-          r.model.padEnd(24),
+          r.model.padEnd(28),
           String(r.inputTokens).padEnd(8),
           String(r.outputTokens).padEnd(8),
+          String(r.cacheReadTokens).padEnd(10),
+          String(r.cacheWriteTokens).padEnd(10),
           '$' + r.costUsd.toFixed(6),
         ].join('  ')
       );
@@ -288,26 +350,41 @@ usageCmd
 // ─── check-budget ────────────────────────────────────────────────────────────
 program
   .command('check-budget')
-  .description('Exit non-zero if any blocking budget is exceeded (used by Paperclip hook)')
+  .description('Exit non-zero if token quota or any blocking $ budget is exceeded (used by Paperclip hook)')
   .option('--agent-id <agentId>', 'Agent ID to scope the check (informational)')
-  .action((opts: { agentId?: string }) => {
+  .option('--skip-quota', 'Skip token quota check (use $ budget only)', false)
+  .action((opts: { agentId?: string; skipQuota: boolean }) => {
     const config = loadConfig();
     const db = openDb(config.dbPath);
-    const budgets = db.listBudgets();
-
-    const blocking = budgets.filter(b => b.action === 'block');
-    if (blocking.length === 0) {
-      db.close();
-      process.exit(0);
-    }
 
     let exceeded = false;
+
+    // ── Primary: token quota % check ─────────────────────────────────────────
+    if (!opts.skipQuota) {
+      const quota = db.getTokenQuotaStatus(config.plan);
+      if (quota.allPercent >= 1.0) {
+        const pct = (quota.allPercent * 100).toFixed(1);
+        console.error(
+          chalk.red(`  ✗ Token quota exceeded: ${pct}% of weekly ${quota.plan} all-model limit (${quota.allLimitTokens.toLocaleString()} tokens)`)
+        );
+        exceeded = true;
+      } else if (quota.allPercent >= 0.8) {
+        const pct = (quota.allPercent * 100).toFixed(1);
+        console.error(
+          chalk.yellow(`  ⚠ Token quota warning: ${pct}% of weekly ${quota.plan} all-model limit`)
+        );
+      }
+    }
+
+    // ── Secondary: $ budget block check (kept for backwards-compat) ──────────
+    const budgets = db.listBudgets();
+    const blocking = budgets.filter(b => b.action === 'block');
     for (const budget of blocking) {
       const status = db.getBudgetStatus(budget);
       if (status.usagePercent >= 1) {
         const pct = (status.usagePercent * 100).toFixed(1);
         console.error(
-          chalk.red(`  ✗ Budget '${budget.name}' exceeded: ${pct}% of $${budget.limitUsd}/${budget.period}`)
+          chalk.red(`  ✗ $ Budget '${budget.name}' exceeded: ${pct}% of $${budget.limitUsd}/${budget.period}`)
         );
         exceeded = true;
       }
@@ -316,7 +393,7 @@ program
     db.close();
     if (exceeded) {
       if (opts.agentId) {
-        console.error(chalk.red(`  Agent ${opts.agentId} is over budget. Blocking heartbeat.`));
+        console.error(chalk.red(`  Agent ${opts.agentId} is over limit. Blocking heartbeat.`));
       }
       process.exit(1);
     }
@@ -407,8 +484,12 @@ program
           }
 
           const result = db!.insertUsageFromSource(
-            { provider: 'anthropic', model, inputTokens, outputTokens, costUsd, timestamp,
-              metadata: { cacheRead, cacheWrite, sessionId: entry.sessionId, sourceFile: file } },
+            {
+              provider: 'anthropic', model, inputTokens, outputTokens,
+              cacheReadTokens: cacheRead, cacheWriteTokens: cacheWrite,
+              costUsd, timestamp,
+              metadata: { sessionId: entry.sessionId, sourceFile: file },
+            },
             sourceId,
           );
           if (result.inserted) totalInserted++;

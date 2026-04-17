@@ -1,8 +1,8 @@
 import Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
-import { UsageRecord, Budget, BudgetStatus } from './types.js';
+import { UsageRecord, Budget, BudgetStatus, TokenQuotaStatus, ClaudePlan, CLAUDE_PLAN_LIMITS } from './types.js';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 export function openDb(path: string = '.agent-scheduler.db'): AgentSchedulerDb {
   const db = new Database(path);
@@ -53,6 +53,13 @@ function migrate(db: Database.Database): void {
     `);
   }
 
+  if (version < 3) {
+    db.exec(`
+      ALTER TABLE usage_records ADD COLUMN cache_read_tokens  INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE usage_records ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0;
+    `);
+  }
+
   db.pragma(`user_version = ${SCHEMA_VERSION}`);
 }
 
@@ -64,9 +71,11 @@ export class AgentSchedulerDb {
     const timestamp = new Date();
     this.db.prepare(`
       INSERT INTO usage_records
-        (id, timestamp, provider, model, input_tokens, output_tokens, cost_usd, agent_id, task_id, metadata)
+        (id, timestamp, provider, model, input_tokens, output_tokens,
+         cache_read_tokens, cache_write_tokens, cost_usd, agent_id, task_id, metadata)
       VALUES
-        (@id, @timestamp, @provider, @model, @inputTokens, @outputTokens, @costUsd, @agentId, @taskId, @metadata)
+        (@id, @timestamp, @provider, @model, @inputTokens, @outputTokens,
+         @cacheReadTokens, @cacheWriteTokens, @costUsd, @agentId, @taskId, @metadata)
     `).run({
       id,
       timestamp: timestamp.toISOString(),
@@ -74,12 +83,20 @@ export class AgentSchedulerDb {
       model: record.model,
       inputTokens: record.inputTokens,
       outputTokens: record.outputTokens,
+      cacheReadTokens: record.cacheReadTokens ?? 0,
+      cacheWriteTokens: record.cacheWriteTokens ?? 0,
       costUsd: record.costUsd,
       agentId: record.agentId ?? null,
       taskId: record.taskId ?? null,
       metadata: record.metadata ? JSON.stringify(record.metadata) : null,
     });
-    return { ...record, id, timestamp };
+    return {
+      ...record,
+      id,
+      timestamp,
+      cacheReadTokens: record.cacheReadTokens ?? 0,
+      cacheWriteTokens: record.cacheWriteTokens ?? 0,
+    };
   }
 
   /**
@@ -93,9 +110,11 @@ export class AgentSchedulerDb {
     const id = randomUUID();
     const result = this.db.prepare(`
       INSERT OR IGNORE INTO usage_records
-        (id, timestamp, provider, model, input_tokens, output_tokens, cost_usd, agent_id, task_id, metadata, source_id)
+        (id, timestamp, provider, model, input_tokens, output_tokens,
+         cache_read_tokens, cache_write_tokens, cost_usd, agent_id, task_id, metadata, source_id)
       VALUES
-        (@id, @timestamp, @provider, @model, @inputTokens, @outputTokens, @costUsd, @agentId, @taskId, @metadata, @sourceId)
+        (@id, @timestamp, @provider, @model, @inputTokens, @outputTokens,
+         @cacheReadTokens, @cacheWriteTokens, @costUsd, @agentId, @taskId, @metadata, @sourceId)
     `).run({
       id,
       timestamp: record.timestamp.toISOString(),
@@ -103,6 +122,8 @@ export class AgentSchedulerDb {
       model: record.model,
       inputTokens: record.inputTokens,
       outputTokens: record.outputTokens,
+      cacheReadTokens: record.cacheReadTokens ?? 0,
+      cacheWriteTokens: record.cacheWriteTokens ?? 0,
       costUsd: record.costUsd,
       agentId: record.agentId ?? null,
       taskId: record.taskId ?? null,
@@ -153,6 +174,54 @@ export class AgentSchedulerDb {
     };
   }
 
+  /**
+   * Calculate token quota status for the current Monday-anchored week,
+   * mirroring the logic shown in `claude /usage`.
+   */
+  getTokenQuotaStatus(plan: ClaudePlan = 'max-5x'): TokenQuotaStatus {
+    const { periodStart, periodEnd } = getWeekBounds();
+    const limits = CLAUDE_PLAN_LIMITS[plan];
+
+    const rows = this.db.prepare(`
+      SELECT model,
+             COALESCE(SUM(input_tokens), 0)        AS input_tokens,
+             COALESCE(SUM(output_tokens), 0)       AS output_tokens,
+             COALESCE(SUM(cache_read_tokens), 0)   AS cache_read_tokens,
+             COALESCE(SUM(cache_write_tokens), 0)  AS cache_write_tokens
+      FROM usage_records
+      WHERE timestamp >= ? AND timestamp < ?
+      GROUP BY model
+    `).all(periodStart.toISOString(), periodEnd.toISOString()) as Array<{
+      model: string;
+      input_tokens: number;
+      output_tokens: number;
+      cache_read_tokens: number;
+      cache_write_tokens: number;
+    }>;
+
+    let allTokens = 0;
+    let sonnetTokens = 0;
+    for (const r of rows) {
+      const total = r.input_tokens + r.output_tokens + r.cache_read_tokens + r.cache_write_tokens;
+      allTokens += total;
+      if (r.model.toLowerCase().includes('sonnet')) {
+        sonnetTokens += total;
+      }
+    }
+
+    return {
+      plan,
+      periodStart,
+      periodEnd,
+      allTokens,
+      sonnetTokens,
+      allLimitTokens: limits.weeklyAll,
+      sonnetLimitTokens: limits.weeklySonnet,
+      allPercent: limits.weeklyAll > 0 ? allTokens / limits.weeklyAll : 0,
+      sonnetPercent: limits.weeklySonnet > 0 ? sonnetTokens / limits.weeklySonnet : 0,
+    };
+  }
+
   listBudgets(): Budget[] {
     return (this.db.prepare('SELECT * FROM budgets').all() as any[]).map(rowToBudget);
   }
@@ -180,6 +249,16 @@ export class AgentSchedulerDb {
   }
 }
 
+/** Monday-anchored weekly window, matching claude /usage behaviour. */
+function getWeekBounds(): { periodStart: Date; periodEnd: Date } {
+  const now = new Date();
+  const day = now.getDay(); // 0=Sun, 1=Mon … 6=Sat
+  const daysFromMonday = day === 0 ? 6 : day - 1;
+  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysFromMonday);
+  const end = new Date(start.getTime() + 7 * 86_400_000);
+  return { periodStart: start, periodEnd: end };
+}
+
 function getPeriodBounds(period: Budget['period']): { periodStart: Date; periodEnd: Date } {
   const now = new Date();
   if (period === 'daily') {
@@ -188,10 +267,7 @@ function getPeriodBounds(period: Budget['period']): { periodStart: Date; periodE
     return { periodStart: start, periodEnd: end };
   }
   if (period === 'weekly') {
-    const day = now.getDay(); // 0 = Sunday
-    const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - day);
-    const end = new Date(start.getTime() + 7 * 86_400_000);
-    return { periodStart: start, periodEnd: end };
+    return getWeekBounds();
   }
   // monthly
   const start = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -207,6 +283,8 @@ function rowToUsage(row: any): UsageRecord {
     model: row.model,
     inputTokens: row.input_tokens,
     outputTokens: row.output_tokens,
+    cacheReadTokens: row.cache_read_tokens ?? 0,
+    cacheWriteTokens: row.cache_write_tokens ?? 0,
     costUsd: row.cost_usd,
     agentId: row.agent_id ?? undefined,
     taskId: row.task_id ?? undefined,

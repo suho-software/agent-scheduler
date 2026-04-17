@@ -4,6 +4,8 @@ import type { AgentSchedulerDb } from './db.js';
 export type AnthropicUsage = {
   input_tokens: number;
   output_tokens: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
 };
 
 export class BudgetExceededError extends Error {
@@ -29,12 +31,16 @@ export function wrapAnthropic<T extends { messages: { create: (...args: any[]) =
     const response = await originalCreate(...args);
     const model: string = response.model ?? args[0]?.model ?? 'unknown';
     const usage: AnthropicUsage = response.usage ?? { input_tokens: 0, output_tokens: 0 };
+    const cacheReadTokens = usage.cache_read_input_tokens ?? 0;
+    const cacheWriteTokens = usage.cache_creation_input_tokens ?? 0;
 
     onUsage({
       provider: 'anthropic',
       model,
       inputTokens: usage.input_tokens,
       outputTokens: usage.output_tokens,
+      cacheReadTokens,
+      cacheWriteTokens,
       costUsd: calcCostUsd(model, usage.input_tokens, usage.output_tokens),
     });
 

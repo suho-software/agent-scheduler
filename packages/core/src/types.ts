@@ -7,6 +7,8 @@ export interface UsageRecord {
   model: string;
   inputTokens: number;
   outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
   costUsd: number;
   agentId?: string;
   taskId?: string;
@@ -38,6 +40,27 @@ export interface BudgetStatus {
   usagePercent: number;
   periodStart: Date;
   periodEnd: Date;
+}
+
+/** Claude subscription plan tiers and their weekly token limits */
+export const CLAUDE_PLAN_LIMITS = {
+  'pro':     { weeklyAll: 50_000_000,    weeklySonnet: 175_000_000 },
+  'max-5x':  { weeklyAll: 288_000_000,   weeklySonnet: 1_008_000_000 },
+  'max-20x': { weeklyAll: 1_152_000_000, weeklySonnet: 4_032_000_000 },
+} as const;
+
+export type ClaudePlan = keyof typeof CLAUDE_PLAN_LIMITS;
+
+export interface TokenQuotaStatus {
+  plan: ClaudePlan;
+  periodStart: Date;
+  periodEnd: Date;
+  allTokens: number;
+  sonnetTokens: number;
+  allLimitTokens: number;
+  sonnetLimitTokens: number;
+  allPercent: number;
+  sonnetPercent: number;
 }
 
 // Token pricing per 1M tokens (USD)
