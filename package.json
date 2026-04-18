@@ -8,7 +8,8 @@
   ],
   "scripts": {
     "build": "turbo build",
-    "dev": "turbo dev"
+    "dev": "turbo dev",
+    "test": "turbo test"
   },
   "packageManager": "npm@10.9.4",
   "devDependencies": {

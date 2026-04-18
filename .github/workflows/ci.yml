@@ -25,6 +25,9 @@ jobs:
       - name: Build packages
         run: npm run build --workspace=packages/core --workspace=packages/cli
 
+      - name: Run tests
+        run: npm test --workspace=packages/core
+
       - name: Validate plugin.json
         run: node -e "JSON.parse(require('fs').readFileSync('packages/paperclip-plugin/plugin.json','utf8')); console.log('plugin.json OK')"
         working-directory: ./
