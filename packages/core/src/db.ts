@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { UsageRecord, Budget, BudgetStatus, TokenQuotaStatus, SessionStats, ClaudePlan, CLAUDE_PLAN_LIMITS, CLAUDE_SESSION_LIMITS } from './types.js';
@@ -236,21 +236,28 @@ export class AgentSchedulerDb {
    * tokens from all agents sharing the DB (CEO, CTO, etc.), producing values like 847% that
    * are physically impossible for a single session. stats-cache.json is per-user ground truth.
    */
-  getSessionStats(plan: ClaudePlan = 'max-5x', _statsCachePathOverride?: string): SessionStats {
+  getSessionStats(
+    plan: ClaudePlan = 'max-5x',
+    _statsCachePathOverride?: string,
+    _projectsDirOverride?: string,
+  ): SessionStats {
     const limits = CLAUDE_SESSION_LIMITS[plan];
     const now = new Date();
     const todayStr = now.toISOString().slice(0, 10); // YYYY-MM-DD (UTC date)
 
-    // Weekly token quota from DB (authoritative subscription utilization metric)
+    // Weekly token quota from DB (Paperclip bridge sessions only — kept for diagnostics)
     const weeklyQuota = this.getTokenQuotaStatus(plan);
 
-    // Read stats-cache.json for currentSession and weekly session counts
+    const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+    // ── stats-cache.json: session counts only ──────────────────────────────────
+    // NOTE: stats-cache.json token data is frequently stale (months old in practice).
+    // We use it only for session count metadata; tokens come from JSONL files instead.
     const statsPath = _statsCachePathOverride ?? join(homedir(), '.claude', 'stats-cache.json');
     let todayTokens = 0;
     let fromStatsCache = false;
     let weeklyCount = 0;
     let sessionsHitLimit = 0;
-    let statsCacheWeeklyTokens = 0;
 
     if (existsSync(statsPath)) {
       try {
@@ -259,14 +266,12 @@ export class AgentSchedulerDb {
           dailyModelTokens?: { date: string; tokensByModel: Record<string, number> }[];
         };
 
-        // Today's session tokens (for currentSession — mirrors claude /usage)
+        // Today's session tokens from stats-cache (fallback; may be stale)
         const todayEntry = (cache.dailyModelTokens ?? []).find(e => e.date === todayStr);
         if (todayEntry) {
           todayTokens = Object.values(todayEntry.tokensByModel).reduce((s, v) => s + v, 0);
           fromStatsCache = true;
         }
-
-        const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
 
         for (const entry of cache.dailyActivity ?? []) {
           if (new Date(entry.date + 'T00:00:00Z') >= sevenDaysAgo) {
@@ -283,13 +288,18 @@ export class AgentSchedulerDb {
         }
         for (const tokens of Object.values(tokensByDate)) {
           if (tokens >= limits.fiveHourTokens) sessionsHitLimit++;
-          // Accumulate weekly total from stats-cache (all Claude Code sessions, incl. board direct)
-          statsCacheWeeklyTokens += tokens;
         }
       } catch {
-        // stats-cache.json unreadable — return zero counts
+        // stats-cache.json unreadable — session counts stay at 0
       }
     }
+
+    // ── JSONL-based weekly token aggregation (ground truth) ───────────────────
+    // Scans ~/.claude/projects/**/*.jsonl for the rolling 7-day window.
+    // Covers ALL Claude Code sessions: Paperclip bridge + board direct terminal/IDE.
+    // Uses message id deduplication (streaming appends same id multiple times).
+    const projectsDir = _projectsDirOverride ?? join(homedir(), '.claude', 'projects');
+    const statsCacheWeeklyTokens = readWeeklyTokensFromJsonl(projectsDir, sevenDaysAgo);
 
     // Minutes until midnight UTC (stats-cache session window resets daily)
     let minutesUntilReset: number | null = null;
@@ -354,6 +364,73 @@ export class AgentSchedulerDb {
   close(): void {
     this.db.close();
   }
+}
+
+/**
+ * Scan ~/.claude/projects/**​/*.jsonl for assistant messages within the rolling window.
+ * Deduplicates by message id (streaming writes the same message multiple times per file).
+ * Uses file mtime as a fast pre-filter to skip sessions older than the window.
+ *
+ * This is the ground-truth source for ALL Claude Code sessions — Paperclip bridge and
+ * board direct terminal/IDE sessions alike — unlike stats-cache.json (which is stale)
+ * or the agent-scheduler DB (which only has bridge-routed sessions).
+ */
+function readWeeklyTokensFromJsonl(
+  projectsDir: string,
+  windowStart: Date,
+): number {
+  let totalTokens = 0;
+  const seenIds = new Set<string>();
+
+  let projectDirs: string[];
+  try { projectDirs = readdirSync(projectsDir); } catch { return 0; }
+
+  for (const dirName of projectDirs) {
+    const dirPath = join(projectsDir, dirName);
+    let files: string[];
+    try {
+      if (!statSync(dirPath).isDirectory()) continue;
+      files = readdirSync(dirPath);
+    } catch { continue; }
+
+    for (const file of files) {
+      if (!file.endsWith('.jsonl')) continue;
+      const filePath = join(dirPath, file);
+
+      // Fast mtime pre-filter — skip files not touched since the window opened
+      try { if (statSync(filePath).mtime < windowStart) continue; } catch { continue; }
+
+      let content: string;
+      try { content = readFileSync(filePath, 'utf-8'); } catch { continue; }
+
+      for (const line of content.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        let entry: { timestamp?: string; message?: { id?: string; role?: string; usage?: Record<string, number> } };
+        try { entry = JSON.parse(trimmed); } catch { continue; }
+
+        if (!entry.timestamp || new Date(entry.timestamp) < windowStart) continue;
+        const msg = entry.message;
+        if (!msg || msg.role !== 'assistant' || !msg.usage) continue;
+
+        // Deduplicate: streaming appends the same message id multiple times
+        const mid = msg.id;
+        if (mid) {
+          if (seenIds.has(mid)) continue;
+          seenIds.add(mid);
+        }
+
+        const u = msg.usage;
+        totalTokens +=
+          (u['input_tokens'] ?? 0) +
+          (u['output_tokens'] ?? 0) +
+          (u['cache_read_input_tokens'] ?? 0) +
+          (u['cache_creation_input_tokens'] ?? 0);
+      }
+    }
+  }
+
+  return totalTokens;
 }
 
 /** Monday-anchored weekly window, matching claude /usage behaviour. */

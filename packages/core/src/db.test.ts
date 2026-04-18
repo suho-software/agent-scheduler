@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { writeFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { openDb, AgentSchedulerDb } from './db.js';
@@ -251,9 +251,9 @@ describe('AgentSchedulerDb.getTokenQuotaStatus', () => {
   });
 });
 
-// ─── getSessionStats — statsCacheWeekly (SUH-386 max-policy) ──────────────────
+// ─── getSessionStats — JSONL-based weekly tokens (SUH-386 max-policy fix) ─────
 
-describe('AgentSchedulerDb.getSessionStats — stats-cache max policy', () => {
+describe('AgentSchedulerDb.getSessionStats — JSONL-based weekly token aggregation', () => {
   let db: AgentSchedulerDb;
   let tmpDir: string;
 
@@ -266,47 +266,83 @@ describe('AgentSchedulerDb.getSessionStats — stats-cache max policy', () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  function writeFakeStatsCache(weeklyTokens: number, path: string): void {
-    const today = new Date().toISOString().slice(0, 10);
-    const cache = {
-      dailyActivity: [{ date: today, sessionCount: 1 }],
-      dailyModelTokens: [{ date: today, tokensByModel: { 'claude-sonnet-4-6': weeklyTokens } }],
-    };
-    writeFileSync(path, JSON.stringify(cache));
+  /** Write fake JSONL session files into a projects-dir structure. */
+  function writeJsonlSession(
+    projectSubdir: string,
+    sessionFile: string,
+    messages: Array<{ id: string; inputTokens: number; outputTokens: number; cacheRead?: number; timestamp?: string }>,
+  ): void {
+    const projectDir = join(tmpDir, projectSubdir);
+    mkdirSync(projectDir, { recursive: true });
+    const lines = messages.flatMap((m) => {
+      const ts = m.timestamp ?? new Date().toISOString();
+      const entry = {
+        timestamp: ts,
+        message: {
+          id: m.id,
+          role: 'assistant',
+          model: 'claude-sonnet-4-6',
+          usage: {
+            input_tokens: m.inputTokens,
+            output_tokens: m.outputTokens,
+            cache_read_input_tokens: m.cacheRead ?? 0,
+            cache_creation_input_tokens: 0,
+          },
+        },
+      };
+      // Simulate streaming: append the same entry twice (like real Claude Code writes)
+      return [JSON.stringify(entry), JSON.stringify(entry)];
+    });
+    writeFileSync(join(projectDir, sessionFile), lines.join('\n'));
   }
 
-  it('statsCacheAllPercent reflects board direct usage (70% scenario)', () => {
-    const plan = 'max-5x';
-    const weeklyLimit = CLAUDE_PLAN_LIMITS[plan].weeklyAll; // 288_000_000
-    const boardTokens = Math.round(weeklyLimit * 0.70); // simulate 70% board usage
-    const cachePath = join(tmpDir, 'stats-cache.json');
-    writeFakeStatsCache(boardTokens, cachePath);
-
-    const sessions = db.getSessionStats(plan, cachePath);
-    // stats-cache percent should be ~70%
-    expect(sessions.weeklyTokens.statsCacheAllPercent).toBeGreaterThanOrEqual(0.69);
-    expect(sessions.weeklyTokens.statsCacheAllPercent).toBeLessThanOrEqual(0.71);
-  });
-
-  it('statsCacheAllPercent > DB allPercent triggers throttle via max policy', () => {
+  it('reads weekly tokens from JSONL and deduplicates streaming duplicates', () => {
     const plan = 'max-5x';
     const weeklyLimit = CLAUDE_PLAN_LIMITS[plan].weeklyAll;
-    // DB has 0 tokens (agent idle), board has 70% via stats-cache
-    const cachePath = join(tmpDir, 'stats-cache.json');
-    writeFakeStatsCache(Math.round(weeklyLimit * 0.70), cachePath);
+    // Write a session with 2 unique messages, each duplicated (streaming)
+    writeJsonlSession('project-a', 'session1.jsonl', [
+      { id: 'msg-1', inputTokens: 100_000, outputTokens: 50_000 },
+      { id: 'msg-2', inputTokens: 200_000, outputTokens: 80_000 },
+    ]);
 
-    const sessions = db.getSessionStats(plan, cachePath);
-    const dbPct = sessions.weeklyTokens.allPercent;        // ~0 (no DB records)
-    const localPct = sessions.weeklyTokens.statsCacheAllPercent; // ~0.70
-
-    // Max policy: effective throttle signal = max(dbPct, localPct) ≥ 0.70 → STOP
-    const effectivePct = Math.max(dbPct, localPct);
-    expect(effectivePct).toBeGreaterThanOrEqual(0.70);
-    expect(dbPct).toBe(0); // confirms agent had no usage
+    const sessions = db.getSessionStats(plan, undefined, tmpDir);
+    // Expected: (100k+50k) + (200k+80k) = 430k — NOT 860k (no double-counting)
+    expect(sessions.weeklyTokens.statsCacheAllTokens).toBe(430_000);
+    expect(sessions.weeklyTokens.statsCacheAllPercent).toBeCloseTo(430_000 / weeklyLimit, 5);
   });
 
-  it('statsCacheAllPercent falls back to 0 when no stats-cache file exists', () => {
-    const sessions = db.getSessionStats('max-5x', join(tmpDir, 'nonexistent.json'));
+  it('statsCacheAllPercent reflects board direct usage (70% scenario → STOP)', () => {
+    const plan = 'max-5x';
+    const weeklyLimit = CLAUDE_PLAN_LIMITS[plan].weeklyAll;
+    // 70% board usage: 201_600_000 tokens (input only for simplicity)
+    const boardTokens = Math.round(weeklyLimit * 0.70);
+    writeJsonlSession('board-project', 'direct-session.jsonl', [
+      { id: 'board-msg-1', inputTokens: boardTokens, outputTokens: 0 },
+    ]);
+
+    const sessions = db.getSessionStats(plan, undefined, tmpDir);
+    // DB has 0 tokens (agent idle), JSONL has 70% board usage
+    expect(sessions.weeklyTokens.allPercent).toBe(0);           // DB: agent idle
+    expect(sessions.weeklyTokens.statsCacheAllPercent).toBeGreaterThanOrEqual(0.69);
+    expect(sessions.weeklyTokens.statsCacheAllPercent).toBeLessThanOrEqual(0.71);
+
+    // Max policy in quota-json: max(0, 0.70) ≥ 0.70 → STOP
+    const effectivePct = Math.max(sessions.weeklyTokens.allPercent, sessions.weeklyTokens.statsCacheAllPercent);
+    expect(effectivePct).toBeGreaterThanOrEqual(0.70);
+  });
+
+  it('excludes messages older than 7 days', () => {
+    const eightDaysAgo = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+    writeJsonlSession('old-project', 'old-session.jsonl', [
+      { id: 'old-msg', inputTokens: 999_999_999, outputTokens: 0, timestamp: eightDaysAgo },
+    ]);
+
+    const sessions = db.getSessionStats('max-5x', undefined, tmpDir);
+    expect(sessions.weeklyTokens.statsCacheAllTokens).toBe(0);
+  });
+
+  it('returns 0 when projects directory does not exist', () => {
+    const sessions = db.getSessionStats('max-5x', undefined, join(tmpDir, 'nonexistent'));
     expect(sessions.weeklyTokens.statsCacheAllTokens).toBe(0);
     expect(sessions.weeklyTokens.statsCacheAllPercent).toBe(0);
   });
