@@ -25,6 +25,10 @@ function loadConfig(): Config {
       plan: (raw.plan as ClaudePlan) ?? 'max-5x',
     };
   }
+  process.stderr.write(
+    chalk.yellow('  ⚠ No ~/.agent-scheduler.json found — using default plan: max-5x\n') +
+    chalk.gray('    Run: agent-scheduler init  (to set your actual plan: pro / max-5x / max-20x)\n')
+  );
   return { dbPath: join(homedir(), '.agent-scheduler.db'), defaultBudgetUsd: 10, plan: 'max-5x' };
 }
 
