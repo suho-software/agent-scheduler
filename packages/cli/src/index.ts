@@ -316,9 +316,14 @@ const usageCmd = program
     console.log(chalk.gray(`  ${ws.count} / ${ws.quota} sessions\n`));
 
     // ── Weekly token window ──────────────────────────────────────────────────
-    console.log(chalk.bold('  All models (this week)'));
-    console.log(`  ${bar(quota.allPercent)}  ${pctLabel(quota.allPercent)}`);
-    console.log(chalk.gray(`  ${fmtTokens(quota.allTokens)} / ${fmtTokens(quota.allLimitTokens)} tokens\n`));
+    const localWeeklyPct = sessions.weeklyTokens.statsCacheAllPercent;
+    const effectiveWeeklyPct = Math.max(sessions.weeklyTokens.allPercent, localWeeklyPct);
+    const scopeNote = localWeeklyPct > sessions.weeklyTokens.allPercent
+      ? chalk.yellow(` · board direct: ${(localWeeklyPct * 100).toFixed(1)}% (higher — throttle uses this)`)
+      : chalk.gray(` · board direct: ${(localWeeklyPct * 100).toFixed(1)}%`);
+    console.log(chalk.bold('  All models (this week)') + scopeNote);
+    console.log(`  ${bar(effectiveWeeklyPct)}  ${pctLabel(effectiveWeeklyPct)}`);
+    console.log(chalk.gray(`  ${fmtTokens(quota.allTokens)} / ${fmtTokens(quota.allLimitTokens)} tokens (bridge)  ·  ${fmtTokens(sessions.weeklyTokens.statsCacheAllTokens)} (board total)\n`));
 
     console.log(chalk.bold('  Sonnet (this week)'));
     console.log(`  ${bar(quota.sonnetPercent)}  ${pctLabel(quota.sonnetPercent)}`);
@@ -338,14 +343,24 @@ usageCmd
     const sessions = db.getSessionStats(config.plan);
     db.close();
 
+    // Max policy (Option 2): conservative throttle signal = max(DB metric, stats-cache metric).
+    // DB metric: Paperclip bridge sessions only.
+    // stats-cache metric: ALL Claude Code sessions including board direct terminal/IDE usage.
+    // Using max() ensures the board's direct usage is never ignored.
+    const dbWeeklyPct = Math.round(sessions.weeklyTokens.allPercent * 100 * 10) / 10;
+    const localWeeklyPct = Math.round(sessions.weeklyTokens.statsCacheAllPercent * 100 * 10) / 10;
+    const weeklyAllPct = Math.max(dbWeeklyPct, localWeeklyPct);
+
     // currentSessionPct: from stats-cache.json today's tokens vs session limit (0-100).
     //   Matches `claude /usage` "Current session" semantics. 0 when no stats-cache entry for today.
-    // weeklyAllPct: weekly all-model token quota from DB (0-100).
+    // weeklyAllPct: MAX of DB (bridge-only) and stats-cache (all board sessions).
     //   Use this as the authoritative throttle signal for subscription utilization.
     console.log(JSON.stringify({
       currentSessionPct: Math.round(sessions.currentSession.percent * 100 * 10) / 10,
       weeklySessionsPct: Math.round(sessions.weeklySessions.percent * 100 * 10) / 10,
-      weeklyAllPct: Math.round(sessions.weeklyTokens.allPercent * 100 * 10) / 10,
+      weeklyAllPct,
+      weeklyAllPct_db: dbWeeklyPct,
+      weeklyAllPct_local: localWeeklyPct,
       weeklyAllTokens: sessions.weeklyTokens.allTokens,
       weeklyAllLimitTokens: sessions.weeklyTokens.allLimitTokens,
       minutesUntilReset: sessions.currentSession.minutesUntilReset,

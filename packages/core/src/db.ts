@@ -236,7 +236,7 @@ export class AgentSchedulerDb {
    * tokens from all agents sharing the DB (CEO, CTO, etc.), producing values like 847% that
    * are physically impossible for a single session. stats-cache.json is per-user ground truth.
    */
-  getSessionStats(plan: ClaudePlan = 'max-5x'): SessionStats {
+  getSessionStats(plan: ClaudePlan = 'max-5x', _statsCachePathOverride?: string): SessionStats {
     const limits = CLAUDE_SESSION_LIMITS[plan];
     const now = new Date();
     const todayStr = now.toISOString().slice(0, 10); // YYYY-MM-DD (UTC date)
@@ -245,11 +245,12 @@ export class AgentSchedulerDb {
     const weeklyQuota = this.getTokenQuotaStatus(plan);
 
     // Read stats-cache.json for currentSession and weekly session counts
-    const statsPath = join(homedir(), '.claude', 'stats-cache.json');
+    const statsPath = _statsCachePathOverride ?? join(homedir(), '.claude', 'stats-cache.json');
     let todayTokens = 0;
     let fromStatsCache = false;
     let weeklyCount = 0;
     let sessionsHitLimit = 0;
+    let statsCacheWeeklyTokens = 0;
 
     if (existsSync(statsPath)) {
       try {
@@ -282,6 +283,8 @@ export class AgentSchedulerDb {
         }
         for (const tokens of Object.values(tokensByDate)) {
           if (tokens >= limits.fiveHourTokens) sessionsHitLimit++;
+          // Accumulate weekly total from stats-cache (all Claude Code sessions, incl. board direct)
+          statsCacheWeeklyTokens += tokens;
         }
       } catch {
         // stats-cache.json unreadable — return zero counts
@@ -297,6 +300,9 @@ export class AgentSchedulerDb {
     }
 
     const todayStart = new Date(todayStr + 'T00:00:00Z');
+    const statsCacheWeeklyAllPercent = weeklyQuota.allLimitTokens > 0
+      ? Math.min(1, statsCacheWeeklyTokens / weeklyQuota.allLimitTokens)
+      : 0;
 
     return {
       currentSession: {
@@ -317,6 +323,8 @@ export class AgentSchedulerDb {
         allTokens: weeklyQuota.allTokens,
         allLimitTokens: weeklyQuota.allLimitTokens,
         allPercent: Math.min(1, weeklyQuota.allPercent),
+        statsCacheAllTokens: statsCacheWeeklyTokens,
+        statsCacheAllPercent: statsCacheWeeklyAllPercent,
       },
     };
   }

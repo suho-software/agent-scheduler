@@ -103,7 +103,15 @@ export interface SessionStats {
   weeklyTokens: {
     allTokens: number;
     allLimitTokens: number;
+    /** Percent from agent-scheduler DB (Paperclip bridge sessions only). Always in [0, 1]. */
     allPercent: number;
+    /**
+     * Percent computed from ~/.claude/stats-cache.json (all board Claude Code sessions, including
+     * direct terminal/IDE sessions that bypass the Paperclip bridge). Always in [0, 1].
+     * 0 when stats-cache has no weekly data.
+     */
+    statsCacheAllTokens: number;
+    statsCacheAllPercent: number;
   };
 }
 

@@ -1,5 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { openDb, AgentSchedulerDb } from './db.js';
+import { CLAUDE_PLAN_LIMITS } from './types.js';
 
 /** Open a fresh in-memory DB for each test (no file I/O, fully isolated). */
 function freshDb(): AgentSchedulerDb {
@@ -244,5 +248,66 @@ describe('AgentSchedulerDb.getTokenQuotaStatus', () => {
     db.insertUsage({ provider: 'anthropic', model: 'claude-sonnet-4-6', inputTokens: 100_000, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0 });
     const quota = db.getTokenQuotaStatus('max-5x');
     expect(quota.allPercent).toBeGreaterThan(0);
+  });
+});
+
+// ─── getSessionStats — statsCacheWeekly (SUH-386 max-policy) ──────────────────
+
+describe('AgentSchedulerDb.getSessionStats — stats-cache max policy', () => {
+  let db: AgentSchedulerDb;
+  let tmpDir: string;
+
+  beforeEach(() => {
+    db = freshDb();
+    tmpDir = mkdtempSync(join(tmpdir(), 'agent-sched-test-'));
+  });
+  afterEach(() => {
+    db.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function writeFakeStatsCache(weeklyTokens: number, path: string): void {
+    const today = new Date().toISOString().slice(0, 10);
+    const cache = {
+      dailyActivity: [{ date: today, sessionCount: 1 }],
+      dailyModelTokens: [{ date: today, tokensByModel: { 'claude-sonnet-4-6': weeklyTokens } }],
+    };
+    writeFileSync(path, JSON.stringify(cache));
+  }
+
+  it('statsCacheAllPercent reflects board direct usage (70% scenario)', () => {
+    const plan = 'max-5x';
+    const weeklyLimit = CLAUDE_PLAN_LIMITS[plan].weeklyAll; // 288_000_000
+    const boardTokens = Math.round(weeklyLimit * 0.70); // simulate 70% board usage
+    const cachePath = join(tmpDir, 'stats-cache.json');
+    writeFakeStatsCache(boardTokens, cachePath);
+
+    const sessions = db.getSessionStats(plan, cachePath);
+    // stats-cache percent should be ~70%
+    expect(sessions.weeklyTokens.statsCacheAllPercent).toBeGreaterThanOrEqual(0.69);
+    expect(sessions.weeklyTokens.statsCacheAllPercent).toBeLessThanOrEqual(0.71);
+  });
+
+  it('statsCacheAllPercent > DB allPercent triggers throttle via max policy', () => {
+    const plan = 'max-5x';
+    const weeklyLimit = CLAUDE_PLAN_LIMITS[plan].weeklyAll;
+    // DB has 0 tokens (agent idle), board has 70% via stats-cache
+    const cachePath = join(tmpDir, 'stats-cache.json');
+    writeFakeStatsCache(Math.round(weeklyLimit * 0.70), cachePath);
+
+    const sessions = db.getSessionStats(plan, cachePath);
+    const dbPct = sessions.weeklyTokens.allPercent;        // ~0 (no DB records)
+    const localPct = sessions.weeklyTokens.statsCacheAllPercent; // ~0.70
+
+    // Max policy: effective throttle signal = max(dbPct, localPct) ≥ 0.70 → STOP
+    const effectivePct = Math.max(dbPct, localPct);
+    expect(effectivePct).toBeGreaterThanOrEqual(0.70);
+    expect(dbPct).toBe(0); // confirms agent had no usage
+  });
+
+  it('statsCacheAllPercent falls back to 0 when no stats-cache file exists', () => {
+    const sessions = db.getSessionStats('max-5x', join(tmpDir, 'nonexistent.json'));
+    expect(sessions.weeklyTokens.statsCacheAllTokens).toBe(0);
+    expect(sessions.weeklyTokens.statsCacheAllPercent).toBe(0);
   });
 });
