@@ -70,15 +70,23 @@ export const CLAUDE_SESSION_LIMITS: Record<ClaudePlan, { fiveHourTokens: number;
   'max-20x': { fiveHourTokens: 20_000_000, weeklySessionQuota: 57 },
 };
 
-/** Session-level usage metrics (current 5-hr window + weekly session count). */
+/** Session-level usage metrics (current session + weekly session count + weekly token quota). */
 export interface SessionStats {
+  /**
+   * Current session token usage derived from ~/.claude/stats-cache.json (today's total).
+   * This mirrors `claude /usage` "Current session" semantics.
+   * percent is always in [0, 1] range.
+   * When stats-cache.json has no entry for today, tokens=0 and percent=0.
+   */
   currentSession: {
     tokens: number;
     limitTokens: number;
     percent: number;
     windowStart: Date;
-    /** Minutes until the oldest record in the 5-hr window expires. Null if no records. */
+    /** Minutes until midnight UTC (session window reset). Null when no activity today. */
     minutesUntilReset: number | null;
+    /** True when derived from stats-cache.json; false when stats-cache had no today entry. */
+    fromStatsCache: boolean;
   };
   weeklySessions: {
     count: number;
@@ -86,6 +94,16 @@ export interface SessionStats {
     percent: number;
     /** Sessions in the last 7 days that exhausted the token limit. */
     sessionsHitLimit: number;
+  };
+  /**
+   * Weekly subscription token utilization from the agent-scheduler DB.
+   * This is the authoritative signal for subscription quota — use this for throttle decisions.
+   * Aggregates all agents sharing the DB; always in [0, 1] range.
+   */
+  weeklyTokens: {
+    allTokens: number;
+    allLimitTokens: number;
+    allPercent: number;
   };
 }
 

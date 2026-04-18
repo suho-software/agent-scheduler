@@ -294,12 +294,13 @@ const usageCmd = program
     console.log(chalk.gray(`  Plan: ${quota.plan}   Week: ${quota.periodStart.toISOString().slice(0,10)} → ${quota.periodEnd.toISOString().slice(0,10)}`));
     console.log(chalk.gray(`  Resets ${resetDate}\n`));
 
-    // ── Current session (5-hour rolling window) ──────────────────────────────
+    // ── Current session (today from stats-cache.json) ────────────────────────
     const cs = sessions.currentSession;
+    const sourceNote = cs.fromStatsCache ? chalk.gray(' · via stats-cache.json') : chalk.yellow(' · stats-cache has no data for today');
     const resetLabel = cs.minutesUntilReset !== null
       ? chalk.gray(` · reset in ${cs.minutesUntilReset}m`)
-      : chalk.gray(' · no activity');
-    console.log(chalk.bold(`  Current session`) + chalk.gray(`  (5-hr window since ${cs.windowStart.toISOString().replace('T',' ').slice(0,16)} UTC)`) + resetLabel);
+      : '';
+    console.log(chalk.bold(`  Current session`) + chalk.gray(`  (today UTC: ${cs.windowStart.toISOString().slice(0,10)})`) + sourceNote + resetLabel);
     console.log(`  ${bar(cs.percent)}  ${pctLabel(cs.percent)}`);
     console.log(chalk.gray(`  ${fmtTokens(cs.tokens)} / ${fmtTokens(cs.limitTokens)} tokens\n`));
 
@@ -333,9 +334,16 @@ usageCmd
     const sessions = db.getSessionStats(config.plan);
     db.close();
 
+    // currentSessionPct: from stats-cache.json today's tokens vs session limit (0-100).
+    //   Matches `claude /usage` "Current session" semantics. 0 when no stats-cache entry for today.
+    // weeklyAllPct: weekly all-model token quota from DB (0-100).
+    //   Use this as the authoritative throttle signal for subscription utilization.
     console.log(JSON.stringify({
       currentSessionPct: Math.round(sessions.currentSession.percent * 100 * 10) / 10,
       weeklySessionsPct: Math.round(sessions.weeklySessions.percent * 100 * 10) / 10,
+      weeklyAllPct: Math.round(sessions.weeklyTokens.allPercent * 100 * 10) / 10,
+      weeklyAllTokens: sessions.weeklyTokens.allTokens,
+      weeklyAllLimitTokens: sessions.weeklyTokens.allLimitTokens,
       minutesUntilReset: sessions.currentSession.minutesUntilReset,
       weeklySessions: sessions.weeklySessions.count,
       weeklySessionQuota: sessions.weeklySessions.quota,

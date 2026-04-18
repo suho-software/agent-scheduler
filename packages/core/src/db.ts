@@ -226,32 +226,28 @@ export class AgentSchedulerDb {
   }
 
   /**
-   * Session-level usage: current 5-hour rolling window (from DB) +
-   * weekly session count (from ~/.claude/stats-cache.json).
+   * Session-level usage:
+   * - currentSession: today's token total from ~/.claude/stats-cache.json (mirrors `claude /usage`).
+   *   Falls back to 0 when stats-cache has no entry for today. percent is always in [0, 1].
+   * - weeklySessions: session count from stats-cache.json.
+   * - weeklyTokens: weekly all-model token quota from the DB — use this for throttle decisions.
+   *
+   * NOTE: The DB 5-hr rolling aggregate is NOT used for currentSession because it accumulates
+   * tokens from all agents sharing the DB (CEO, CTO, etc.), producing values like 847% that
+   * are physically impossible for a single session. stats-cache.json is per-user ground truth.
    */
   getSessionStats(plan: ClaudePlan = 'max-5x'): SessionStats {
     const limits = CLAUDE_SESSION_LIMITS[plan];
     const now = new Date();
-    const fiveHourStart = new Date(now.getTime() - 5 * 60 * 60 * 1000);
+    const todayStr = now.toISOString().slice(0, 10); // YYYY-MM-DD (UTC date)
 
-    // Current session token usage (5-hour rolling window)
-    const fiveHourRow = this.db.prepare(
-      'SELECT COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens), 0) AS tokens' +
-      ' FROM usage_records WHERE timestamp >= ? AND provider = \'anthropic\''
-    ).get(fiveHourStart.toISOString()) as { tokens: number };
+    // Weekly token quota from DB (authoritative subscription utilization metric)
+    const weeklyQuota = this.getTokenQuotaStatus(plan);
 
-    const earliestRow = this.db.prepare(
-      'SELECT MIN(timestamp) AS earliest FROM usage_records WHERE timestamp >= ? AND provider = \'anthropic\''
-    ).get(fiveHourStart.toISOString()) as { earliest: string | null };
-
-    let minutesUntilReset: number | null = null;
-    if (earliestRow.earliest) {
-      const resetAt = new Date(new Date(earliestRow.earliest).getTime() + 5 * 60 * 60 * 1000);
-      minutesUntilReset = Math.max(0, Math.round((resetAt.getTime() - now.getTime()) / 60_000));
-    }
-
-    // Weekly session count from ~/.claude/stats-cache.json
+    // Read stats-cache.json for currentSession and weekly session counts
     const statsPath = join(homedir(), '.claude', 'stats-cache.json');
+    let todayTokens = 0;
+    let fromStatsCache = false;
     let weeklyCount = 0;
     let sessionsHitLimit = 0;
 
@@ -261,6 +257,13 @@ export class AgentSchedulerDb {
           dailyActivity?: { date: string; sessionCount: number }[];
           dailyModelTokens?: { date: string; tokensByModel: Record<string, number> }[];
         };
+
+        // Today's session tokens (for currentSession — mirrors claude /usage)
+        const todayEntry = (cache.dailyModelTokens ?? []).find(e => e.date === todayStr);
+        if (todayEntry) {
+          todayTokens = Object.values(todayEntry.tokensByModel).reduce((s, v) => s + v, 0);
+          fromStatsCache = true;
+        }
 
         const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
 
@@ -285,19 +288,35 @@ export class AgentSchedulerDb {
       }
     }
 
+    // Minutes until midnight UTC (stats-cache session window resets daily)
+    let minutesUntilReset: number | null = null;
+    if (todayTokens > 0) {
+      const tomorrowMidnightUTC = new Date(todayStr);
+      tomorrowMidnightUTC.setUTCDate(tomorrowMidnightUTC.getUTCDate() + 1);
+      minutesUntilReset = Math.max(0, Math.round((tomorrowMidnightUTC.getTime() - now.getTime()) / 60_000));
+    }
+
+    const todayStart = new Date(todayStr + 'T00:00:00Z');
+
     return {
       currentSession: {
-        tokens: fiveHourRow.tokens,
+        tokens: todayTokens,
         limitTokens: limits.fiveHourTokens,
-        percent: limits.fiveHourTokens > 0 ? fiveHourRow.tokens / limits.fiveHourTokens : 0,
-        windowStart: fiveHourStart,
+        percent: limits.fiveHourTokens > 0 ? Math.min(1, todayTokens / limits.fiveHourTokens) : 0,
+        windowStart: todayStart,
         minutesUntilReset,
+        fromStatsCache,
       },
       weeklySessions: {
         count: weeklyCount,
         quota: limits.weeklySessionQuota,
         percent: limits.weeklySessionQuota > 0 ? weeklyCount / limits.weeklySessionQuota : 0,
         sessionsHitLimit,
+      },
+      weeklyTokens: {
+        allTokens: weeklyQuota.allTokens,
+        allLimitTokens: weeklyQuota.allLimitTokens,
+        allPercent: Math.min(1, weeklyQuota.allPercent),
       },
     };
   }
