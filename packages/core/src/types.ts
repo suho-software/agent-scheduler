@@ -84,10 +84,10 @@ export const CLAUDE_SESSION_LIMITS: Record<ClaudePlan, { fiveHourTokens: number;
 /** Session-level usage metrics (current session + weekly session count + weekly token quota). */
 export interface SessionStats {
   /**
-   * Current session token usage derived from ~/.claude/stats-cache.json (today's total).
+   * Current session token usage derived from ~/.claude/projects/**​/*.jsonl (today UTC window).
    * This mirrors `claude /usage` "Current session" semantics.
    * percent is always in [0, 1] range.
-   * When stats-cache.json has no entry for today, tokens=0 and percent=0.
+   * When no JSONL activity exists for today, tokens=0 and percent=0.
    */
   currentSession: {
     tokens: number;
@@ -96,7 +96,7 @@ export interface SessionStats {
     windowStart: Date;
     /** Minutes until midnight UTC (session window reset). Null when no activity today. */
     minutesUntilReset: number | null;
-    /** True when derived from stats-cache.json; false when stats-cache had no today entry. */
+    /** True when JSONL files contain activity for today; false when no today activity found. */
     fromStatsCache: boolean;
   };
   weeklySessions: {

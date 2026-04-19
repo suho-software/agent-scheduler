@@ -298,9 +298,9 @@ const usageCmd = program
     console.log(chalk.gray(`  Plan: ${quota.plan}   Week: ${quota.periodStart.toISOString().slice(0,10)} → ${quota.periodEnd.toISOString().slice(0,10)}`));
     console.log(chalk.gray(`  Resets ${resetDate}\n`));
 
-    // ── Current session (today from stats-cache.json) ────────────────────────
+    // ── Current session (today from JSONL files) ──────────────────────────────
     const cs = sessions.currentSession;
-    const sourceNote = cs.fromStatsCache ? chalk.gray(' · via stats-cache.json') : chalk.yellow(' · stats-cache has no data for today');
+    const sourceNote = cs.fromStatsCache ? chalk.gray(' · via JSONL') : chalk.yellow(' · no JSONL activity today');
     const resetLabel = cs.minutesUntilReset !== null
       ? chalk.gray(` · reset in ${cs.minutesUntilReset}m`)
       : '';
@@ -319,11 +319,11 @@ const usageCmd = program
     const localWeeklyPct = sessions.weeklyTokens.statsCacheAllPercent;
     const effectiveWeeklyPct = Math.max(sessions.weeklyTokens.allPercent, localWeeklyPct);
     const scopeNote = localWeeklyPct > sessions.weeklyTokens.allPercent
-      ? chalk.yellow(` · board direct: ${(localWeeklyPct * 100).toFixed(1)}% (higher — throttle uses this)`)
-      : chalk.gray(` · board direct: ${(localWeeklyPct * 100).toFixed(1)}%`);
+      ? chalk.yellow(` · JSONL total: ${(localWeeklyPct * 100).toFixed(1)}% (higher — throttle uses this)`)
+      : chalk.gray(` · JSONL total: ${(localWeeklyPct * 100).toFixed(1)}%`);
     console.log(chalk.bold('  All models (this week)') + scopeNote);
     console.log(`  ${bar(effectiveWeeklyPct)}  ${pctLabel(effectiveWeeklyPct)}`);
-    console.log(chalk.gray(`  ${fmtTokens(quota.allTokens)} / ${fmtTokens(quota.allLimitTokens)} tokens (bridge)  ·  ${fmtTokens(sessions.weeklyTokens.statsCacheAllTokens)} (board total)\n`));
+    console.log(chalk.gray(`  ${fmtTokens(quota.allTokens)} / ${fmtTokens(quota.allLimitTokens)} tokens (bridge DB)  ·  ${fmtTokens(sessions.weeklyTokens.statsCacheAllTokens)} (JSONL all sessions)\n`));
 
     console.log(chalk.bold('  Sonnet (this week)'));
     console.log(`  ${bar(quota.sonnetPercent)}  ${pctLabel(quota.sonnetPercent)}`);
@@ -351,10 +351,13 @@ usageCmd
     const localWeeklyPct = Math.round(sessions.weeklyTokens.statsCacheAllPercent * 100 * 10) / 10;
     const weeklyAllPct = Math.max(dbWeeklyPct, localWeeklyPct);
 
-    // currentSessionPct: from stats-cache.json today's tokens vs session limit (0-100).
-    //   Matches `claude /usage` "Current session" semantics. 0 when no stats-cache entry for today.
-    // weeklyAllPct: MAX of DB (bridge-only) and stats-cache (all board sessions).
+    // currentSessionPct: today's JSONL token total vs per-session limit (0-100).
+    //   Matches `claude /usage` "Current session" semantics. 0 when no JSONL activity today.
+    // weeklyAllPct: MAX of DB (bridge-only) and JSONL (all board sessions).
     //   Use this as the authoritative throttle signal for subscription utilization.
+    // weeklyAllPct_db: agent-scheduler SQL DB only (Paperclip bridge sessions). May be 0 if DB
+    //   is not populated this week (board sessions routed directly, not through the bridge).
+    // weeklyAllPct_local: JSONL aggregate — all Claude Code sessions including board direct.
     console.log(JSON.stringify({
       currentSessionPct: Math.round(sessions.currentSession.percent * 100 * 10) / 10,
       weeklySessionsPct: Math.round(sessions.weeklySessions.percent * 100 * 10) / 10,

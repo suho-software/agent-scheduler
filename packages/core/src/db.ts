@@ -226,15 +226,15 @@ export class AgentSchedulerDb {
   }
 
   /**
-   * Session-level usage:
-   * - currentSession: today's token total from ~/.claude/stats-cache.json (mirrors `claude /usage`).
-   *   Falls back to 0 when stats-cache has no entry for today. percent is always in [0, 1].
-   * - weeklySessions: session count from stats-cache.json.
-   * - weeklyTokens: weekly all-model token quota from the DB — use this for throttle decisions.
+   * Session-level usage — all metrics derived from JSONL files (no stats-cache.json dependency):
+   * - currentSession: today's token total from ~/.claude/projects/**​/*.jsonl (today UTC window).
+   * - weeklySessions: session count from JSONL (each .jsonl file = one Claude Code session).
+   * - weeklyTokens: weekly all-model token quota from the DB and JSONL.
    *
-   * NOTE: The DB 5-hr rolling aggregate is NOT used for currentSession because it accumulates
-   * tokens from all agents sharing the DB (CEO, CTO, etc.), producing values like 847% that
-   * are physically impossible for a single session. stats-cache.json is per-user ground truth.
+   * Each JSONL file corresponds to exactly one session (filename = session UUID), making
+   * session counting straightforward without gap-detection heuristics.
+   *
+   * @param _statsCachePathOverride - deprecated; kept for API compat, no longer read
    */
   getSessionStats(
     plan: ClaudePlan = 'max-5x',
@@ -244,64 +244,30 @@ export class AgentSchedulerDb {
     const limits = CLAUDE_SESSION_LIMITS[plan];
     const now = new Date();
     const todayStr = now.toISOString().slice(0, 10); // YYYY-MM-DD (UTC date)
+    const todayStart = new Date(todayStr + 'T00:00:00Z');
 
     // Weekly token quota from DB (Paperclip bridge sessions only — kept for diagnostics)
     const weeklyQuota = this.getTokenQuotaStatus(plan);
 
     const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-
-    // ── stats-cache.json: session counts only ──────────────────────────────────
-    // NOTE: stats-cache.json token data is frequently stale (months old in practice).
-    // We use it only for session count metadata; tokens come from JSONL files instead.
-    const statsPath = _statsCachePathOverride ?? join(homedir(), '.claude', 'stats-cache.json');
-    let todayTokens = 0;
-    let fromStatsCache = false;
-    let weeklyCount = 0;
-    let sessionsHitLimit = 0;
-
-    if (existsSync(statsPath)) {
-      try {
-        const cache = JSON.parse(readFileSync(statsPath, 'utf-8')) as {
-          dailyActivity?: { date: string; sessionCount: number }[];
-          dailyModelTokens?: { date: string; tokensByModel: Record<string, number> }[];
-        };
-
-        // Today's session tokens from stats-cache (fallback; may be stale)
-        const todayEntry = (cache.dailyModelTokens ?? []).find(e => e.date === todayStr);
-        if (todayEntry) {
-          todayTokens = Object.values(todayEntry.tokensByModel).reduce((s, v) => s + v, 0);
-          fromStatsCache = true;
-        }
-
-        for (const entry of cache.dailyActivity ?? []) {
-          if (new Date(entry.date + 'T00:00:00Z') >= sevenDaysAgo) {
-            weeklyCount += entry.sessionCount;
-          }
-        }
-
-        const tokensByDate: Record<string, number> = {};
-        for (const entry of cache.dailyModelTokens ?? []) {
-          if (new Date(entry.date + 'T00:00:00Z') >= sevenDaysAgo) {
-            const dayTotal = Object.values(entry.tokensByModel).reduce((s, v) => s + v, 0);
-            tokensByDate[entry.date] = (tokensByDate[entry.date] ?? 0) + dayTotal;
-          }
-        }
-        for (const tokens of Object.values(tokensByDate)) {
-          if (tokens >= limits.fiveHourTokens) sessionsHitLimit++;
-        }
-      } catch {
-        // stats-cache.json unreadable — session counts stay at 0
-      }
-    }
-
-    // ── JSONL-based weekly token aggregation (ground truth) ───────────────────
-    // Scans ~/.claude/projects/**/*.jsonl for the rolling 7-day window.
-    // Covers ALL Claude Code sessions: Paperclip bridge + board direct terminal/IDE.
-    // Uses message id deduplication (streaming appends same id multiple times).
     const projectsDir = _projectsDirOverride ?? join(homedir(), '.claude', 'projects');
-    const statsCacheWeeklyTokens = readWeeklyTokensFromJsonl(projectsDir, sevenDaysAgo);
 
-    // Minutes until midnight UTC (stats-cache session window resets daily)
+    // ── JSONL: today's tokens (current session) ────────────────────────────────
+    // Replaces stale stats-cache.json. JSONL is updated in real-time by Claude Code.
+    const todayTokens = readTokensFromJsonl(projectsDir, todayStart);
+
+    // ── JSONL: weekly session count ────────────────────────────────────────────
+    // Each .jsonl file = one session (filename is session UUID). Count files with
+    // any assistant-message activity in the 7-day window.
+    const { count: weeklyCount, sessionsHitLimit } = readSessionCountFromJsonl(
+      projectsDir, sevenDaysAgo, limits.fiveHourTokens,
+    );
+
+    // ── JSONL: weekly token aggregation (ground truth) ────────────────────────
+    // Covers ALL Claude Code sessions: Paperclip bridge + board direct terminal/IDE.
+    const statsCacheWeeklyTokens = readTokensFromJsonl(projectsDir, sevenDaysAgo);
+
+    // Minutes until midnight UTC (daily session window reset)
     let minutesUntilReset: number | null = null;
     if (todayTokens > 0) {
       const tomorrowMidnightUTC = new Date(todayStr);
@@ -309,7 +275,6 @@ export class AgentSchedulerDb {
       minutesUntilReset = Math.max(0, Math.round((tomorrowMidnightUTC.getTime() - now.getTime()) / 60_000));
     }
 
-    const todayStart = new Date(todayStr + 'T00:00:00Z');
     const statsCacheWeeklyAllPercent = weeklyQuota.allLimitTokens > 0
       ? Math.min(1, statsCacheWeeklyTokens / weeklyQuota.allLimitTokens)
       : 0;
@@ -321,7 +286,8 @@ export class AgentSchedulerDb {
         percent: limits.fiveHourTokens > 0 ? Math.min(1, todayTokens / limits.fiveHourTokens) : 0,
         windowStart: todayStart,
         minutesUntilReset,
-        fromStatsCache,
+        // true = got real JSONL data for today; false = no activity found yet today
+        fromStatsCache: todayTokens > 0,
       },
       weeklySessions: {
         count: weeklyCount,
@@ -403,7 +369,7 @@ export class AgentSchedulerDb {
 }
 
 /**
- * Scan ~/.claude/projects/**​/*.jsonl for assistant messages within the rolling window.
+ * Scan ~/.claude/projects/**​/*.jsonl for assistant messages within [windowStart, now).
  * Deduplicates by message id (streaming writes the same message multiple times per file).
  * Uses file mtime as a fast pre-filter to skip sessions older than the window.
  *
@@ -411,7 +377,7 @@ export class AgentSchedulerDb {
  * board direct terminal/IDE sessions alike — unlike stats-cache.json (which is stale)
  * or the agent-scheduler DB (which only has bridge-routed sessions).
  */
-function readWeeklyTokensFromJsonl(
+function readTokensFromJsonl(
   projectsDir: string,
   windowStart: Date,
 ): number {
@@ -467,6 +433,80 @@ function readWeeklyTokensFromJsonl(
   }
 
   return totalTokens;
+}
+
+/**
+ * Count Claude Code sessions active within [windowStart, now) from JSONL files.
+ * Each .jsonl file corresponds to exactly one session (filename = session UUID).
+ * Per-session tokens are computed for sessionsHitLimit tracking.
+ */
+function readSessionCountFromJsonl(
+  projectsDir: string,
+  windowStart: Date,
+  sessionTokenLimit: number,
+): { count: number; sessionsHitLimit: number } {
+  let count = 0;
+  let sessionsHitLimit = 0;
+
+  let projectDirs: string[];
+  try { projectDirs = readdirSync(projectsDir); } catch { return { count: 0, sessionsHitLimit: 0 }; }
+
+  for (const dirName of projectDirs) {
+    const dirPath = join(projectsDir, dirName);
+    let files: string[];
+    try {
+      if (!statSync(dirPath).isDirectory()) continue;
+      files = readdirSync(dirPath);
+    } catch { continue; }
+
+    for (const file of files) {
+      if (!file.endsWith('.jsonl')) continue;
+      const filePath = join(dirPath, file);
+
+      // Fast mtime pre-filter — skip files untouched since window start
+      try { if (statSync(filePath).mtime < windowStart) continue; } catch { continue; }
+
+      let content: string;
+      try { content = readFileSync(filePath, 'utf-8'); } catch { continue; }
+
+      let sessionTokens = 0;
+      let hasActivityInWindow = false;
+      const seenIds = new Set<string>();
+
+      for (const line of content.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        let entry: { timestamp?: string; message?: { id?: string; role?: string; usage?: Record<string, number> } };
+        try { entry = JSON.parse(trimmed); } catch { continue; }
+
+        if (!entry.timestamp || new Date(entry.timestamp) < windowStart) continue;
+        const msg = entry.message;
+        if (!msg || msg.role !== 'assistant' || !msg.usage) continue;
+
+        hasActivityInWindow = true;
+
+        const mid = msg.id;
+        if (mid) {
+          if (seenIds.has(mid)) continue;
+          seenIds.add(mid);
+        }
+
+        const u = msg.usage;
+        sessionTokens +=
+          (u['input_tokens'] ?? 0) +
+          (u['output_tokens'] ?? 0) +
+          (u['cache_read_input_tokens'] ?? 0) +
+          (u['cache_creation_input_tokens'] ?? 0);
+      }
+
+      if (hasActivityInWindow) {
+        count++;
+        if (sessionTokens >= sessionTokenLimit) sessionsHitLimit++;
+      }
+    }
+  }
+
+  return { count, sessionsHitLimit };
 }
 
 /** Monday-anchored weekly window, matching claude /usage behaviour. */
