@@ -252,13 +252,17 @@ export class AgentSchedulerDb {
     const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
     const projectsDir = _projectsDirOverride ?? join(homedir(), '.claude', 'projects');
 
-    // ── JSONL: today's tokens (current session) ────────────────────────────────
-    // Replaces stale stats-cache.json. JSONL is updated in real-time by Claude Code.
-    const todayTokens = readTokensFromJsonl(projectsDir, todayStart);
+    // ── JSONL: current session tokens ─────────────────────────────────────────
+    // "Current session" = the most recently modified .jsonl file, scoped to the
+    // last 5 hours (one Claude session window). Using a time window prevents
+    // counting all historical tokens from a large project's JSONL history.
+    const fiveHoursAgo = new Date(now.getTime() - 5 * 60 * 60 * 1000);
+    const currentSession = readCurrentSessionFromJsonl(projectsDir, fiveHoursAgo);
+    const currentSessionTokens = currentSession?.tokens ?? 0;
 
-    // ── JSONL: weekly session count ────────────────────────────────────────────
-    // Each .jsonl file = one session (filename is session UUID). Count files with
-    // any assistant-message activity in the 7-day window.
+    // ── JSONL: weekly session count (distinct sessionId) ──────────────────────
+    // Uses the `sessionId` field on each JSONL line — only counts sessions that
+    // actually consumed LLM tokens (assistant messages with usage data).
     const { count: weeklyCount, sessionsHitLimit } = readSessionCountFromJsonl(
       projectsDir, sevenDaysAgo, limits.fiveHourTokens,
     );
@@ -269,7 +273,7 @@ export class AgentSchedulerDb {
 
     // Minutes until midnight UTC (daily session window reset)
     let minutesUntilReset: number | null = null;
-    if (todayTokens > 0) {
+    if (currentSessionTokens > 0) {
       const tomorrowMidnightUTC = new Date(todayStr);
       tomorrowMidnightUTC.setUTCDate(tomorrowMidnightUTC.getUTCDate() + 1);
       minutesUntilReset = Math.max(0, Math.round((tomorrowMidnightUTC.getTime() - now.getTime()) / 60_000));
@@ -281,13 +285,13 @@ export class AgentSchedulerDb {
 
     return {
       currentSession: {
-        tokens: todayTokens,
+        tokens: currentSessionTokens,
         limitTokens: limits.fiveHourTokens,
-        percent: limits.fiveHourTokens > 0 ? Math.min(1, todayTokens / limits.fiveHourTokens) : 0,
+        percent: limits.fiveHourTokens > 0 ? Math.min(1, currentSessionTokens / limits.fiveHourTokens) : 0,
         windowStart: todayStart,
         minutesUntilReset,
-        // true = got real JSONL data for today; false = no activity found yet today
-        fromStatsCache: todayTokens > 0,
+        // true = found an active session with JSONL data; false = no sessions found
+        fromStatsCache: currentSessionTokens > 0,
       },
       weeklySessions: {
         count: weeklyCount,
@@ -436,17 +440,21 @@ function readTokensFromJsonl(
 }
 
 /**
- * Count Claude Code sessions active within [windowStart, now) from JSONL files.
- * Each .jsonl file corresponds to exactly one session (filename = session UUID).
- * Per-session tokens are computed for sessionsHitLimit tracking.
+ * Count distinct Claude Code sessions active within [windowStart, now) using
+ * the `sessionId` field present on every JSONL entry.
+ *
+ * Only sessions that have at least one assistant message with token usage are
+ * counted — this excludes import/attachment-only files that never consumed LLM quota.
+ * Per-session token totals are accumulated for sessionsHitLimit tracking.
  */
 function readSessionCountFromJsonl(
   projectsDir: string,
   windowStart: Date,
   sessionTokenLimit: number,
 ): { count: number; sessionsHitLimit: number } {
-  let count = 0;
-  let sessionsHitLimit = 0;
+  // sessionId → total tokens (only for sessions with assistant usage in window)
+  const sessionTokenMap = new Map<string, number>();
+  const seenMsgIds = new Set<string>(); // global dedup across all files
 
   let projectDirs: string[];
   try { projectDirs = readdirSync(projectsDir); } catch { return { count: 0, sessionsHitLimit: 0 }; }
@@ -469,44 +477,120 @@ function readSessionCountFromJsonl(
       let content: string;
       try { content = readFileSync(filePath, 'utf-8'); } catch { continue; }
 
-      let sessionTokens = 0;
-      let hasActivityInWindow = false;
-      const seenIds = new Set<string>();
-
       for (const line of content.split('\n')) {
         const trimmed = line.trim();
         if (!trimmed) continue;
-        let entry: { timestamp?: string; message?: { id?: string; role?: string; usage?: Record<string, number> } };
+        let entry: { timestamp?: string; sessionId?: string; message?: { id?: string; role?: string; usage?: Record<string, number> } };
         try { entry = JSON.parse(trimmed); } catch { continue; }
 
         if (!entry.timestamp || new Date(entry.timestamp) < windowStart) continue;
+        const sessionId = entry.sessionId;
+        if (!sessionId) continue;
+
         const msg = entry.message;
         if (!msg || msg.role !== 'assistant' || !msg.usage) continue;
 
-        hasActivityInWindow = true;
-
+        // Deduplicate: streaming writes the same message id multiple times
         const mid = msg.id;
         if (mid) {
-          if (seenIds.has(mid)) continue;
-          seenIds.add(mid);
+          if (seenMsgIds.has(mid)) continue;
+          seenMsgIds.add(mid);
         }
 
         const u = msg.usage;
-        sessionTokens +=
+        const tokens =
           (u['input_tokens'] ?? 0) +
           (u['output_tokens'] ?? 0) +
           (u['cache_read_input_tokens'] ?? 0) +
           (u['cache_creation_input_tokens'] ?? 0);
-      }
 
-      if (hasActivityInWindow) {
-        count++;
-        if (sessionTokens >= sessionTokenLimit) sessionsHitLimit++;
+        sessionTokenMap.set(sessionId, (sessionTokenMap.get(sessionId) ?? 0) + tokens);
       }
     }
   }
 
-  return { count, sessionsHitLimit };
+  let sessionsHitLimit = 0;
+  for (const tokens of sessionTokenMap.values()) {
+    if (tokens >= sessionTokenLimit) sessionsHitLimit++;
+  }
+
+  return { count: sessionTokenMap.size, sessionsHitLimit };
+}
+
+/**
+ * Find the most recently active Claude Code session and return its token usage
+ * within the given window.
+ *
+ * "Current session" = the session from the most recently modified .jsonl file,
+ * scoped to [windowStart, now) so we count only the active window's tokens.
+ * JSONL files accumulate all conversation history; without a time filter the total
+ * would include months of prior usage rather than the live session.
+ *
+ * @param windowStart - Only count tokens at or after this timestamp.
+ *   Callers should pass `now - 5h` to match Claude's per-session rolling window.
+ */
+function readCurrentSessionFromJsonl(
+  projectsDir: string,
+  windowStart: Date,
+): { tokens: number; sessionId: string } | null {
+  let latestMtime = 0;
+  let latestFilePath: string | null = null;
+
+  let projectDirs: string[];
+  try { projectDirs = readdirSync(projectsDir); } catch { return null; }
+
+  for (const dirName of projectDirs) {
+    const dirPath = join(projectsDir, dirName);
+    let files: string[];
+    try {
+      if (!statSync(dirPath).isDirectory()) continue;
+      files = readdirSync(dirPath);
+    } catch { continue; }
+
+    for (const file of files) {
+      if (!file.endsWith('.jsonl')) continue;
+      const filePath = join(dirPath, file);
+      try {
+        const mtime = statSync(filePath).mtime.getTime();
+        if (mtime > latestMtime) { latestMtime = mtime; latestFilePath = filePath; }
+      } catch { continue; }
+    }
+  }
+
+  if (!latestFilePath) return null;
+
+  let content: string;
+  try { content = readFileSync(latestFilePath, 'utf-8'); } catch { return null; }
+
+  // Session UUID is the filename (without .jsonl extension)
+  const sessionId = latestFilePath.split('/').pop()!.slice(0, -'.jsonl'.length);
+
+  let tokens = 0;
+  const seenIds = new Set<string>();
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let entry: { timestamp?: string; message?: { id?: string; role?: string; usage?: Record<string, number> } };
+    try { entry = JSON.parse(trimmed); } catch { continue; }
+
+    // Only count tokens within the session window
+    if (!entry.timestamp || new Date(entry.timestamp) < windowStart) continue;
+
+    const msg = entry.message;
+    if (!msg || msg.role !== 'assistant' || !msg.usage) continue;
+
+    const mid = msg.id;
+    if (mid) { if (seenIds.has(mid)) continue; seenIds.add(mid); }
+
+    const u = msg.usage;
+    tokens +=
+      (u['input_tokens'] ?? 0) +
+      (u['output_tokens'] ?? 0) +
+      (u['cache_read_input_tokens'] ?? 0) +
+      (u['cache_creation_input_tokens'] ?? 0);
+  }
+
+  return { tokens, sessionId };
 }
 
 /** Monday-anchored weekly window, matching claude /usage behaviour. */
