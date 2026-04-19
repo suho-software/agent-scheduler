@@ -252,32 +252,20 @@ export class AgentSchedulerDb {
     const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
     const projectsDir = _projectsDirOverride ?? join(homedir(), '.claude', 'projects');
 
-    // ── JSONL: current session tokens ─────────────────────────────────────────
-    // "Current session" = the most recently modified .jsonl file, scoped to the
-    // last 5 hours (one Claude session window). Using a time window prevents
-    // counting all historical tokens from a large project's JSONL history.
-    const fiveHoursAgo = new Date(now.getTime() - 5 * 60 * 60 * 1000);
-    const currentSession = readCurrentSessionFromJsonl(projectsDir, fiveHoursAgo);
-    const currentSessionTokens = currentSession?.tokens ?? 0;
+    // ── JSONL: single scan for both session analysis and weekly token total ────
+    // Collect all (timestamp, tokens) pairs for the 7-day window in one pass.
+    const tokenEntries = collectTokenTimestamps(projectsDir, sevenDaysAgo);
 
-    // ── JSONL: weekly session count (distinct sessionId) ──────────────────────
-    // Uses the `sessionId` field on each JSONL line — only counts sessions that
-    // actually consumed LLM tokens (assistant messages with usage data).
-    const { count: weeklyCount, sessionsHitLimit } = readSessionCountFromJsonl(
-      projectsDir, sevenDaysAgo, limits.fiveHourTokens,
+    // ── Idle-based 5-hour session window counting (Option D) ──────────────────
+    // A new session starts when consecutive assistant-message timestamps are ≥ 5h apart.
+    // CEO probe confirmed: idle-window count ≈ 26 ≈ Claude's 57-quota unit.
+    // Distinct JSONL sessionId ≈ 241 (CLI invocations) — NOT the rate-limit session unit.
+    const sessionResult = countIdleBasedSessions(
+      tokenEntries, 5, limits.fiveHourTokens, now,
     );
 
-    // ── JSONL: weekly token aggregation (ground truth) ────────────────────────
-    // Covers ALL Claude Code sessions: Paperclip bridge + board direct terminal/IDE.
-    const statsCacheWeeklyTokens = readTokensFromJsonl(projectsDir, sevenDaysAgo);
-
-    // Minutes until midnight UTC (daily session window reset)
-    let minutesUntilReset: number | null = null;
-    if (currentSessionTokens > 0) {
-      const tomorrowMidnightUTC = new Date(todayStr);
-      tomorrowMidnightUTC.setUTCDate(tomorrowMidnightUTC.getUTCDate() + 1);
-      minutesUntilReset = Math.max(0, Math.round((tomorrowMidnightUTC.getTime() - now.getTime()) / 60_000));
-    }
+    // Weekly token total: free byproduct of the timestamp collection
+    const statsCacheWeeklyTokens = tokenEntries.reduce((s, e) => s + e.tokens, 0);
 
     const statsCacheWeeklyAllPercent = weeklyQuota.allLimitTokens > 0
       ? Math.min(1, statsCacheWeeklyTokens / weeklyQuota.allLimitTokens)
@@ -285,19 +273,19 @@ export class AgentSchedulerDb {
 
     return {
       currentSession: {
-        tokens: currentSessionTokens,
+        tokens: sessionResult.currentSessionTokens,
         limitTokens: limits.fiveHourTokens,
-        percent: limits.fiveHourTokens > 0 ? Math.min(1, currentSessionTokens / limits.fiveHourTokens) : 0,
+        percent: limits.fiveHourTokens > 0 ? Math.min(1, sessionResult.currentSessionTokens / limits.fiveHourTokens) : 0,
         windowStart: todayStart,
-        minutesUntilReset,
-        // true = found an active session with JSONL data; false = no sessions found
-        fromStatsCache: currentSessionTokens > 0,
+        minutesUntilReset: sessionResult.minutesUntilReset,
+        // true = there is an active session within last 5h; false = session idle/none
+        fromStatsCache: sessionResult.currentSessionTokens > 0,
       },
       weeklySessions: {
-        count: weeklyCount,
+        count: sessionResult.count,
         quota: limits.weeklySessionQuota,
-        percent: limits.weeklySessionQuota > 0 ? weeklyCount / limits.weeklySessionQuota : 0,
-        sessionsHitLimit,
+        percent: limits.weeklySessionQuota > 0 ? sessionResult.count / limits.weeklySessionQuota : 0,
+        sessionsHitLimit: sessionResult.sessionsHitLimit,
       },
       weeklyTokens: {
         allTokens: weeklyQuota.allTokens,
@@ -372,15 +360,148 @@ export class AgentSchedulerDb {
   }
 }
 
+interface TimestampedTokens {
+  timestamp: Date;
+  tokens: number;
+}
+
 /**
- * Scan ~/.claude/projects/**​/*.jsonl for assistant messages within [windowStart, now).
- * Deduplicates by message id (streaming writes the same message multiple times per file).
- * Uses file mtime as a fast pre-filter to skip sessions older than the window.
+ * Scan ~/.claude/projects/**​/*.jsonl and collect (timestamp, tokens) pairs for every
+ * deduplicated assistant message within [windowStart, now).
+ *
+ * Returns entries sorted by timestamp ascending — ready for idle-window session analysis.
+ * Uses file mtime as a fast pre-filter to skip sessions outside the window.
  *
  * This is the ground-truth source for ALL Claude Code sessions — Paperclip bridge and
- * board direct terminal/IDE sessions alike — unlike stats-cache.json (which is stale)
- * or the agent-scheduler DB (which only has bridge-routed sessions).
+ * board direct terminal/IDE sessions alike.
  */
+function collectTokenTimestamps(
+  projectsDir: string,
+  windowStart: Date,
+): TimestampedTokens[] {
+  const entries: TimestampedTokens[] = [];
+  const seenIds = new Set<string>();
+
+  let projectDirs: string[];
+  try { projectDirs = readdirSync(projectsDir); } catch { return []; }
+
+  for (const dirName of projectDirs) {
+    const dirPath = join(projectsDir, dirName);
+    let files: string[];
+    try {
+      if (!statSync(dirPath).isDirectory()) continue;
+      files = readdirSync(dirPath);
+    } catch { continue; }
+
+    for (const file of files) {
+      if (!file.endsWith('.jsonl')) continue;
+      const filePath = join(dirPath, file);
+      try { if (statSync(filePath).mtime < windowStart) continue; } catch { continue; }
+
+      let content: string;
+      try { content = readFileSync(filePath, 'utf-8'); } catch { continue; }
+
+      for (const line of content.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        let entry: { timestamp?: string; message?: { id?: string; role?: string; usage?: Record<string, number> } };
+        try { entry = JSON.parse(trimmed); } catch { continue; }
+
+        if (!entry.timestamp) continue;
+        const ts = new Date(entry.timestamp);
+        if (ts < windowStart) continue;
+
+        const msg = entry.message;
+        if (!msg || msg.role !== 'assistant' || !msg.usage) continue;
+
+        // Deduplicate: streaming appends the same message id multiple times
+        const mid = msg.id;
+        if (mid) { if (seenIds.has(mid)) continue; seenIds.add(mid); }
+
+        const u = msg.usage;
+        const tokens =
+          (u['input_tokens'] ?? 0) +
+          (u['output_tokens'] ?? 0) +
+          (u['cache_read_input_tokens'] ?? 0) +
+          (u['cache_creation_input_tokens'] ?? 0);
+
+        entries.push({ timestamp: ts, tokens });
+      }
+    }
+  }
+
+  entries.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+  return entries;
+}
+
+/**
+ * Apply idle-based 5-hour rolling window session counting to a sorted list of
+ * (timestamp, tokens) entries.
+ *
+ * A new Claude rate-limit session starts whenever there is a gap of ≥ idleHours
+ * between consecutive assistant-message timestamps. This matches Anthropic's session
+ * quota behaviour: Claude Code shows a relative countdown ("Resets in Xhr Ymin")
+ * from last activity, not a fixed UTC grid.
+ *
+ * CEO probe confirmed: distinct JSONL sessionId ≈ 241 (CLI invocations), while the
+ * idle-window count ≈ 26 — the latter matches Claude's 57-session weekly quota unit.
+ */
+function countIdleBasedSessions(
+  entries: TimestampedTokens[],
+  idleHours: number,
+  sessionTokenLimit: number,
+  now: Date,
+): {
+  count: number;
+  sessionsHitLimit: number;
+  currentSessionTokens: number;
+  minutesUntilReset: number | null;
+} {
+  if (entries.length === 0) {
+    return { count: 0, sessionsHitLimit: 0, currentSessionTokens: 0, minutesUntilReset: null };
+  }
+
+  const idleMs = idleHours * 60 * 60 * 1000;
+  let count = 0;
+  let sessionsHitLimit = 0;
+  let sessionTokens = 0;
+  let lastActivityAt: Date | null = null;
+
+  for (const { timestamp, tokens } of entries) {
+    const isNewSession =
+      lastActivityAt === null ||
+      timestamp.getTime() - lastActivityAt.getTime() >= idleMs;
+
+    if (isNewSession) {
+      // Finalize previous session before starting the new one
+      if (count > 0 && sessionTokens >= sessionTokenLimit) sessionsHitLimit++;
+      count++;
+      sessionTokens = 0;
+    }
+
+    sessionTokens += tokens;
+    lastActivityAt = timestamp;
+  }
+  // Finalize the last session
+  if (count > 0 && sessionTokens >= sessionTokenLimit) sessionsHitLimit++;
+
+  // Current session is active only if the last activity was within idleHours of now
+  const isActive =
+    lastActivityAt !== null &&
+    now.getTime() - lastActivityAt.getTime() < idleMs;
+
+  const currentSessionTokens = isActive ? sessionTokens : 0;
+  const minutesUntilReset = isActive && lastActivityAt !== null
+    ? Math.max(0, Math.round((lastActivityAt.getTime() + idleMs - now.getTime()) / 60_000))
+    : null;
+
+  return { count, sessionsHitLimit, currentSessionTokens, minutesUntilReset };
+}
+
+// ---------------------------------------------------------------------------
+// Legacy token-only scan (kept for weekly aggregate; uses same dedup logic)
+// ---------------------------------------------------------------------------
+/** @deprecated Use collectTokenTimestamps + sum instead when session data is also needed. */
 function readTokensFromJsonl(
   projectsDir: string,
   windowStart: Date,
