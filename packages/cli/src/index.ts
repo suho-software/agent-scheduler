@@ -6,7 +6,7 @@ import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, createR
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface as createLineInterface } from 'node:readline';
-import { openDb, calcCostUsdWithCache, CLAUDE_PLAN_LIMITS, ClaudePlan } from '@agent-scheduler/core';
+import { openDb, calcCostUsdWithCache, CLAUDE_PLAN_LIMITS, ClaudePlan, ModelBreakdownRow } from '@agent-scheduler/core';
 
 const CONFIG_PATH = join(homedir(), '.agent-scheduler.json');
 
@@ -367,6 +367,110 @@ usageCmd
       weeklySessions: sessions.weeklySessions.count,
       weeklySessionQuota: sessions.weeklySessions.quota,
     }));
+  });
+
+// ─── usage breakdown ──────────────────────────────────────────────────────────
+usageCmd
+  .command('breakdown')
+  .description('Show per-model token breakdown (input/output/cache) — claude /usage style detail')
+  .option('--session', 'Scope to today (current 5-hour session window)', false)
+  .option('--weekly', 'Scope to current Mon-anchored week (default)', false)
+  .option('--monthly', 'Scope to last 30 days', false)
+  .option('--json', 'Output as JSON', false)
+  .action((opts: { session: boolean; weekly: boolean; monthly: boolean; json: boolean }) => {
+    const config = loadConfig();
+    const db = openDb(config.dbPath);
+
+    // Determine time window
+    const now = new Date();
+    let from: Date;
+    let to: Date = new Date(now.getTime() + 1000); // inclusive upper bound
+    let periodLabel: string;
+
+    if (opts.session) {
+      // Today UTC
+      from = new Date(now.toISOString().slice(0, 10) + 'T00:00:00.000Z');
+      periodLabel = `today (${from.toISOString().slice(0, 10)} UTC)`;
+    } else if (opts.monthly) {
+      from = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+      periodLabel = 'last 30 days';
+    } else {
+      // Weekly (default): current Monday-anchored week
+      const day = now.getUTCDay(); // 0=Sun
+      const daysFromMonday = (day + 6) % 7;
+      from = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - daysFromMonday));
+      to = new Date(from.getTime() + 7 * 24 * 60 * 60 * 1000);
+      periodLabel = `week ${from.toISOString().slice(0, 10)} → ${to.toISOString().slice(0, 10)}`;
+    }
+
+    const rows = db.getModelBreakdown(from, to);
+    db.close();
+
+    if (opts.json) {
+      console.log(JSON.stringify({ period: periodLabel, models: rows }, null, 2));
+      return;
+    }
+
+    function fmtTok(n: number): string {
+      if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(2) + 'B';
+      if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+      if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
+      return String(n);
+    }
+
+    console.log(chalk.bold.cyan('\n  agent-scheduler usage breakdown\n'));
+    console.log(chalk.gray(`  Period: ${periodLabel}\n`));
+
+    if (rows.length === 0) {
+      console.log(chalk.gray('  No usage records in this period.\n'));
+      return;
+    }
+
+    const COL = { model: 30, input: 10, output: 10, cacheR: 10, cacheW: 10, total: 10, cost: 12 };
+    const header = [
+      'Model'.padEnd(COL.model),
+      'Input'.padEnd(COL.input),
+      'Output'.padEnd(COL.output),
+      'CacheRead'.padEnd(COL.cacheR),
+      'CacheWrite'.padEnd(COL.cacheW),
+      'Total'.padEnd(COL.total),
+      'Cost USD',
+    ];
+    console.log(chalk.gray('  ' + header.join('  ')));
+    console.log(chalk.gray('  ' + '─'.repeat(header.join('  ').length)));
+
+    let totIn = 0, totOut = 0, totCR = 0, totCW = 0, totAll = 0, totCost = 0;
+    for (const r of rows) {
+      totIn += r.inputTokens; totOut += r.outputTokens;
+      totCR += r.cacheReadTokens; totCW += r.cacheWriteTokens;
+      totAll += r.totalTokens; totCost += r.costUsd;
+      console.log(
+        '  ' + [
+          r.model.slice(0, COL.model - 1).padEnd(COL.model),
+          fmtTok(r.inputTokens).padEnd(COL.input),
+          fmtTok(r.outputTokens).padEnd(COL.output),
+          fmtTok(r.cacheReadTokens).padEnd(COL.cacheR),
+          fmtTok(r.cacheWriteTokens).padEnd(COL.cacheW),
+          fmtTok(r.totalTokens).padEnd(COL.total),
+          '$' + r.costUsd.toFixed(4),
+        ].join('  ')
+      );
+    }
+
+    // Totals row
+    console.log(chalk.gray('  ' + '─'.repeat(header.join('  ').length)));
+    console.log(
+      chalk.bold('  ' + [
+        'TOTAL'.padEnd(COL.model),
+        fmtTok(totIn).padEnd(COL.input),
+        fmtTok(totOut).padEnd(COL.output),
+        fmtTok(totCR).padEnd(COL.cacheR),
+        fmtTok(totCW).padEnd(COL.cacheW),
+        fmtTok(totAll).padEnd(COL.total),
+        '$' + totCost.toFixed(4),
+      ].join('  '))
+    );
+    console.log();
   });
 
 usageCmd

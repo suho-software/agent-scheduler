@@ -51,6 +51,17 @@ export const CLAUDE_PLAN_LIMITS = {
 
 export type ClaudePlan = keyof typeof CLAUDE_PLAN_LIMITS;
 
+/** Aggregated token usage for a single model within a time window. */
+export interface ModelBreakdownRow {
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  costUsd: number;
+}
+
 export interface TokenQuotaStatus {
   plan: ClaudePlan;
   periodStart: Date;

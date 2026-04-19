@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { UsageRecord, Budget, BudgetStatus, TokenQuotaStatus, SessionStats, ClaudePlan, CLAUDE_PLAN_LIMITS, CLAUDE_SESSION_LIMITS } from './types.js';
+import { UsageRecord, Budget, BudgetStatus, TokenQuotaStatus, SessionStats, ClaudePlan, ModelBreakdownRow, CLAUDE_PLAN_LIMITS, CLAUDE_SESSION_LIMITS } from './types.js';
 
 const SCHEMA_VERSION = 3;
 
@@ -359,6 +359,42 @@ export class AgentSchedulerDb {
       `SELECT * FROM usage_records ${where} ORDER BY timestamp DESC LIMIT ${limit}`
     ).all(params) as any[];
     return rows.map(rowToUsage);
+  }
+
+  /**
+   * Aggregate token usage grouped by model for a given time window.
+   * Returns one row per model, sorted by total tokens descending.
+   */
+  getModelBreakdown(from: Date, to: Date): ModelBreakdownRow[] {
+    const rows = this.db.prepare(`
+      SELECT model,
+             COALESCE(SUM(input_tokens), 0)        AS input_tokens,
+             COALESCE(SUM(output_tokens), 0)       AS output_tokens,
+             COALESCE(SUM(cache_read_tokens), 0)   AS cache_read_tokens,
+             COALESCE(SUM(cache_write_tokens), 0)  AS cache_write_tokens,
+             COALESCE(SUM(cost_usd), 0)            AS cost_usd
+      FROM usage_records
+      WHERE timestamp >= ? AND timestamp < ?
+      GROUP BY model
+      ORDER BY (input_tokens + output_tokens + cache_read_tokens + cache_write_tokens) DESC
+    `).all(from.toISOString(), to.toISOString()) as Array<{
+      model: string;
+      input_tokens: number;
+      output_tokens: number;
+      cache_read_tokens: number;
+      cache_write_tokens: number;
+      cost_usd: number;
+    }>;
+
+    return rows.map(r => ({
+      model: r.model,
+      inputTokens: r.input_tokens,
+      outputTokens: r.output_tokens,
+      cacheReadTokens: r.cache_read_tokens,
+      cacheWriteTokens: r.cache_write_tokens,
+      costUsd: r.cost_usd,
+      totalTokens: r.input_tokens + r.output_tokens + r.cache_read_tokens + r.cache_write_tokens,
+    }));
   }
 
   close(): void {
