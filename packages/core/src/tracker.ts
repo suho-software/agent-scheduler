@@ -1,4 +1,4 @@
-import { calcCostUsd, UsageRecord } from './types.js';
+import { calcCostUsdWithCache, UsageRecord } from './types.js';
 import type { AgentSchedulerDb } from './db.js';
 
 export type AnthropicUsage = {
@@ -41,7 +41,7 @@ export function wrapAnthropic<T extends { messages: { create: (...args: any[]) =
       outputTokens: usage.output_tokens,
       cacheReadTokens,
       cacheWriteTokens,
-      costUsd: calcCostUsd(model, usage.input_tokens, usage.output_tokens),
+      costUsd: calcCostUsdWithCache(model, usage.input_tokens, usage.output_tokens, cacheReadTokens, cacheWriteTokens),
     });
 
     return response;
