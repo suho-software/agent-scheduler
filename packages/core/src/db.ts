@@ -256,13 +256,19 @@ export class AgentSchedulerDb {
     // Collect all (timestamp, tokens) pairs for the 7-day window in one pass.
     const tokenEntries = collectTokenTimestamps(projectsDir, sevenDaysAgo);
 
-    // ── Idle-based 5-hour session window counting (Option D) ──────────────────
-    // A new session starts when consecutive assistant-message timestamps are ≥ 5h apart.
-    // CEO probe confirmed: idle-window count ≈ 26 ≈ Claude's 57-quota unit.
-    // Distinct JSONL sessionId ≈ 241 (CLI invocations) — NOT the rate-limit session unit.
-    const sessionResult = countIdleBasedSessions(
-      tokenEntries, 5, limits.fiveHourTokens, now,
-    );
+    // ── ccusage-style fixed 5h billing blocks (Option E1) ────────────────────
+    // Ported from ryoppippi/ccusage `identifySessionBlocks` (MIT licence).
+    // Block start = floorToHour(firstEntry). New block when:
+    //   timeSinceBlockStart > 5h  OR  timeSinceLastEntry > 5h
+    // This matches Anthropic's fixed billing-window grid, not an idle-rolling window.
+    const blocks = identifySessionBlocks(tokenEntries, 5, now);
+    const activeBlock = blocks.find(b => b.isActive) ?? null;
+    const sessionResult = {
+      count: blocks.length,
+      sessionsHitLimit: blocks.filter(b => b.tokens >= limits.fiveHourTokens).length,
+      currentSessionTokens: activeBlock?.tokens ?? 0,
+      minutesUntilReset: activeBlock?.minutesUntilReset ?? null,
+    };
 
     // Weekly token total: free byproduct of the timestamp collection
     const statsCacheWeeklyTokens = tokenEntries.reduce((s, e) => s + e.tokens, 0);
@@ -434,68 +440,107 @@ function collectTokenTimestamps(
   return entries;
 }
 
-/**
- * Apply idle-based 5-hour rolling window session counting to a sorted list of
- * (timestamp, tokens) entries.
- *
- * A new Claude rate-limit session starts whenever there is a gap of ≥ idleHours
- * between consecutive assistant-message timestamps. This matches Anthropic's session
- * quota behaviour: Claude Code shows a relative countdown ("Resets in Xhr Ymin")
- * from last activity, not a fixed UTC grid.
- *
- * CEO probe confirmed: distinct JSONL sessionId ≈ 241 (CLI invocations), while the
- * idle-window count ≈ 26 — the latter matches Claude's 57-session weekly quota unit.
- */
-function countIdleBasedSessions(
-  entries: TimestampedTokens[],
-  idleHours: number,
-  sessionTokenLimit: number,
-  now: Date,
-): {
-  count: number;
-  sessionsHitLimit: number;
-  currentSessionTokens: number;
-  minutesUntilReset: number | null;
-} {
-  if (entries.length === 0) {
-    return { count: 0, sessionsHitLimit: 0, currentSessionTokens: 0, minutesUntilReset: null };
-  }
+/** Floor a timestamp to the start of its UTC hour (used to anchor session blocks). */
+function floorToHour(ts: Date): Date {
+  const floored = new Date(ts);
+  floored.setUTCMinutes(0, 0, 0);
+  return floored;
+}
 
-  const idleMs = idleHours * 60 * 60 * 1000;
-  let count = 0;
-  let sessionsHitLimit = 0;
-  let sessionTokens = 0;
-  let lastActivityAt: Date | null = null;
+interface SessionBlock {
+  startTime: Date;      // floored to UTC hour
+  endTime: Date;        // startTime + sessionDurationHours
+  tokens: number;
+  lastActivity: Date;
+  isActive: boolean;
+  minutesUntilReset: number | null;
+}
+
+/**
+ * Port of ccusage `identifySessionBlocks` (MIT licence, ryoppippi/ccusage).
+ *
+ * A new billing block starts when EITHER:
+ *   - time since block start  > sessionDurationHours, OR
+ *   - time since last entry   > sessionDurationHours
+ *
+ * Each block's start is floored to the UTC hour of its first entry, giving a
+ * fixed 5-hour window that matches Anthropic's rate-limit billing grid rather
+ * than an idle-rolling window.
+ *
+ * The last block is marked `isActive` when:
+ *   - now < endTime (block window hasn't elapsed), AND
+ *   - now - lastActivity < sessionDurationMs (not idle-expired)
+ * `minutesUntilReset` counts down from endTime (fixed), not last activity.
+ */
+function identifySessionBlocks(
+  entries: TimestampedTokens[],
+  sessionDurationHours: number,
+  now: Date,
+): SessionBlock[] {
+  if (entries.length === 0) return [];
+
+  const sessionDurationMs = sessionDurationHours * 60 * 60 * 1000;
+  const blocks: SessionBlock[] = [];
+
+  let blockStart: Date | null = null;
+  let blockTokens = 0;
+  let lastActivity: Date | null = null;
 
   for (const { timestamp, tokens } of entries) {
-    const isNewSession =
-      lastActivityAt === null ||
-      timestamp.getTime() - lastActivityAt.getTime() >= idleMs;
+    if (blockStart === null) {
+      blockStart = floorToHour(timestamp);
+      blockTokens = tokens;
+      lastActivity = timestamp;
+    } else {
+      const timeSinceBlockStart = timestamp.getTime() - blockStart.getTime();
+      const timeSinceLastEntry = timestamp.getTime() - lastActivity!.getTime();
 
-    if (isNewSession) {
-      // Finalize previous session before starting the new one
-      if (count > 0 && sessionTokens >= sessionTokenLimit) sessionsHitLimit++;
-      count++;
-      sessionTokens = 0;
+      if (timeSinceBlockStart > sessionDurationMs || timeSinceLastEntry > sessionDurationMs) {
+        // Close the current block
+        blocks.push({
+          startTime: blockStart,
+          endTime: new Date(blockStart.getTime() + sessionDurationMs),
+          tokens: blockTokens,
+          lastActivity: lastActivity!,
+          isActive: false,
+          minutesUntilReset: null,
+        });
+        // Open a new block anchored at this entry's floored hour
+        blockStart = floorToHour(timestamp);
+        blockTokens = tokens;
+        lastActivity = timestamp;
+      } else {
+        blockTokens += tokens;
+        lastActivity = timestamp;
+      }
     }
-
-    sessionTokens += tokens;
-    lastActivityAt = timestamp;
   }
-  // Finalize the last session
-  if (count > 0 && sessionTokens >= sessionTokenLimit) sessionsHitLimit++;
 
-  // Current session is active only if the last activity was within idleHours of now
-  const isActive =
-    lastActivityAt !== null &&
-    now.getTime() - lastActivityAt.getTime() < idleMs;
+  // Close final block
+  if (blockStart !== null) {
+    blocks.push({
+      startTime: blockStart,
+      endTime: new Date(blockStart.getTime() + sessionDurationMs),
+      tokens: blockTokens,
+      lastActivity: lastActivity!,
+      isActive: false,
+      minutesUntilReset: null,
+    });
+  }
 
-  const currentSessionTokens = isActive ? sessionTokens : 0;
-  const minutesUntilReset = isActive && lastActivityAt !== null
-    ? Math.max(0, Math.round((lastActivityAt.getTime() + idleMs - now.getTime()) / 60_000))
-    : null;
+  // Mark the last block active if now is still within its window and not idle-expired
+  if (blocks.length > 0) {
+    const last = blocks[blocks.length - 1];
+    const isActive =
+      now < last.endTime &&
+      now.getTime() - last.lastActivity.getTime() < sessionDurationMs;
+    if (isActive) {
+      last.isActive = true;
+      last.minutesUntilReset = Math.max(0, Math.round((last.endTime.getTime() - now.getTime()) / 60_000));
+    }
+  }
 
-  return { count, sessionsHitLimit, currentSessionTokens, minutesUntilReset };
+  return blocks;
 }
 
 // ---------------------------------------------------------------------------

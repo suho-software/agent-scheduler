@@ -364,7 +364,7 @@ usageCmd
       weeklyAllPct,
       weeklyAllPct_db: dbWeeklyPct,
       weeklyAllPct_local: localWeeklyPct,
-      weeklyAllTokens: sessions.weeklyTokens.allTokens,
+      weeklyAllTokens: sessions.weeklyTokens.statsCacheAllTokens,
       weeklyAllLimitTokens: sessions.weeklyTokens.allLimitTokens,
       minutesUntilReset: sessions.currentSession.minutesUntilReset,
       weeklySessions: sessions.weeklySessions.count,
