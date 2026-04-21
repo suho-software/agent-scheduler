@@ -11,18 +11,20 @@ This document outlines the planned direction for agent-scheduler. Priorities shi
 ### Completed ✅
 
 - SQLite-backed usage tracking (no external dependencies)
-- CLI: `init`, `budget set`, `status`
-- Anthropic SDK wrapper (`schedule()`)
+- CLI: `init`, `budget set`, `status`, `budget list`, `budget delete`
+- Anthropic SDK wrapper (`schedule()`, `wrapAnthropic()`) — streaming support included
+- OpenAI SDK wrapper (`wrapOpenAI()`) — auto-injects `stream_options.include_usage`
+- Gemini SDK wrapper (`wrapGeminiModel()`) — wraps `generateContent` + `generateContentStream`
+- Dual CJS+ESM build via tsup (Firebase Functions / Next.js compatible)
+- Human-readable spend report: `agent-scheduler report --period daily|weekly|monthly`
 - Paperclip plugin (hook + skill)
 - GitHub Actions CI/release pipeline
 
 ### In progress / near-term
 
 - [ ] Fix issues surfaced by dogfooding (tracked under [`dogfood` label](https://github.com/suho-software/agent-scheduler/issues?q=label%3Adogfood))
-- [ ] OpenAI SDK wrapper
-- [ ] Gemini SDK wrapper
-- [ ] `budget reset` and `budget list` CLI commands
-- [ ] Human-readable spend report: `agent-scheduler report --period weekly`
+- [ ] `budget reset` CLI command (clear spend counter for a budget period)
+- [ ] Shell completions (bash, zsh, fish)
 
 ### Community contribution opportunities
 
