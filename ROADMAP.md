@@ -24,12 +24,11 @@ This document outlines the planned direction for agent-scheduler. Priorities shi
 ### In progress / near-term
 
 - [ ] Fix issues surfaced by dogfooding (tracked under [`dogfood` label](https://github.com/suho-software/agent-scheduler/issues?q=label%3Adogfood))
-- [ ] Shell completions (bash, zsh, fish)
+- [x] Shell completions (bash, zsh, fish) — `agent-scheduler completion bash|zsh|fish`
 
 ### Community contribution opportunities
 
 - Additional AI provider wrappers (Mistral, Cohere, Bedrock, etc.)
-- Shell completions (bash, zsh, fish)
 - Improved error messages and UX
 - Additional test coverage
 
@@ -70,4 +69,4 @@ This document outlines the planned direction for agent-scheduler. Priorities shi
 
 ---
 
-*Last updated: 2026-04-04*
+*Last updated: 2026-04-21*

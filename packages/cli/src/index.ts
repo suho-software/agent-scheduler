@@ -818,4 +818,274 @@ program
     console.log();
   });
 
+// ─── completion ───────────────────────────────────────────────────────────────
+program
+  .command('completion')
+  .description('Generate shell completion script (bash | zsh | fish)')
+  .argument('<shell>', 'bash | zsh | fish')
+  .addHelpText('after', `
+Examples:
+  # bash — add to ~/.bashrc
+  eval "$(agent-scheduler completion bash)"
+
+  # zsh — add to ~/.zshrc (after compinit)
+  eval "$(agent-scheduler completion zsh)"
+
+  # fish — write to completions dir
+  agent-scheduler completion fish > ~/.config/fish/completions/agent-scheduler.fish`)
+  .action((shell: string) => {
+    switch (shell) {
+      case 'bash':
+        process.stdout.write(bashCompletion());
+        break;
+      case 'zsh':
+        process.stdout.write(zshCompletion());
+        break;
+      case 'fish':
+        process.stdout.write(fishCompletion());
+        break;
+      default:
+        console.error(chalk.red(`  Unknown shell '${shell}'. Supported: bash zsh fish`));
+        process.exit(1);
+    }
+  });
+
 program.parse();
+
+// ─── Completion script generators ────────────────────────────────────────────
+
+function bashCompletion(): string {
+  // Escape ${} bash variable syntax so TypeScript doesn't treat them as template expressions
+  return `# bash completion for agent-scheduler
+# Usage: eval "$(agent-scheduler completion bash)"
+_agent_scheduler_completions() {
+  local cur prev words cword
+  cur="\${COMP_WORDS[COMP_CWORD]}"
+  prev="\${COMP_WORDS[COMP_CWORD-1]}"
+  words=("\${COMP_WORDS[@]}")
+  cword=$COMP_CWORD
+  COMPREPLY=()
+
+  local top_cmds="init status budget usage check-budget sync report completion"
+
+  if [[ $cword -eq 1 ]]; then
+    COMPREPLY=($(compgen -W "$top_cmds" -- "$cur"))
+    return
+  fi
+
+  case "\${words[1]}" in
+    budget)
+      if [[ $cword -eq 2 ]]; then
+        COMPREPLY=($(compgen -W "set delete reset list" -- "$cur"))
+      elif [[ "\${words[2]}" == "set" ]]; then
+        case "$prev" in
+          --period)  COMPREPLY=($(compgen -W "daily weekly monthly" -- "$cur")) ;;
+          --action)  COMPREPLY=($(compgen -W "alert block queue"    -- "$cur")) ;;
+          *)         COMPREPLY=($(compgen -W "--period --action --threshold" -- "$cur")) ;;
+        esac
+      fi
+      ;;
+    usage)
+      if [[ $cword -eq 2 ]]; then
+        COMPREPLY=($(compgen -W "quota-json breakdown list" -- "$cur"))
+      elif [[ "\${words[2]}" == "breakdown" ]]; then
+        COMPREPLY=($(compgen -W "--session --weekly --monthly --json" -- "$cur"))
+      elif [[ "\${words[2]}" == "list" ]]; then
+        case "$prev" in
+          --provider) COMPREPLY=($(compgen -W "anthropic openai gemini" -- "$cur")) ;;
+          *)          COMPREPLY=($(compgen -W "--provider --limit" -- "$cur")) ;;
+        esac
+      fi
+      ;;
+    sync)
+      if [[ $cword -eq 2 ]]; then
+        COMPREPLY=($(compgen -W "claude-code" -- "$cur"))
+      else
+        COMPREPLY=($(compgen -W "--projects-dir --dry-run" -- "$cur"))
+      fi
+      ;;
+    report)
+      case "$prev" in
+        --period) COMPREPLY=($(compgen -W "daily weekly monthly" -- "$cur")) ;;
+        *)        COMPREPLY=($(compgen -W "--period --days --plain" -- "$cur")) ;;
+      esac
+      ;;
+    check-budget)
+      COMPREPLY=($(compgen -W "--agent-id --skip-quota" -- "$cur"))
+      ;;
+    completion)
+      if [[ $cword -eq 2 ]]; then
+        COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
+      fi
+      ;;
+  esac
+}
+complete -F _agent_scheduler_completions agent-scheduler
+`;
+}
+
+function zshCompletion(): string {
+  return `#compdef agent-scheduler
+# zsh completion for agent-scheduler
+# Usage: eval "$(agent-scheduler completion zsh)"
+
+_agent_scheduler() {
+  local context state state_descr line
+  typeset -A opt_args
+
+  _arguments -C \\
+    '1: :->cmd' \\
+    '*: :->args'
+
+  case $state in
+    cmd)
+      local -a commands
+      commands=(
+        'init:Initialize agent-scheduler (interactive wizard)'
+        'status:Show usage percentages against configured budgets'
+        'budget:Manage budgets'
+        'usage:Show token quota status'
+        'check-budget:Exit non-zero if budget is exceeded'
+        'sync:Sync usage data from external sources'
+        'report:Human-readable spend report'
+        'completion:Generate shell completion script'
+      )
+      _describe 'command' commands
+      ;;
+    args)
+      case $words[2] in
+        budget)
+          if [[ $CURRENT -eq 3 ]]; then
+            local -a budget_cmds
+            budget_cmds=(
+              'set:Create or update a named budget'
+              'delete:Delete a budget by id'
+              'reset:Reset spend counter (non-destructive)'
+              'list:List all configured budgets'
+            )
+            _describe 'budget subcommand' budget_cmds
+          elif [[ $words[3] == "set" ]]; then
+            _arguments \\
+              '--period[Budget period]:period:(daily weekly monthly)' \\
+              '--action[Action when exceeded]:action:(alert block queue)' \\
+              '--threshold[Alert threshold 0-1]:threshold:'
+          fi
+          ;;
+        usage)
+          if [[ $CURRENT -eq 3 ]]; then
+            local -a usage_cmds
+            usage_cmds=(
+              'quota-json:Output current quota as JSON'
+              'breakdown:Show per-model token breakdown'
+              'list:List usage records'
+            )
+            _describe 'usage subcommand' usage_cmds
+          elif [[ $words[3] == "breakdown" ]]; then
+            _arguments \\
+              '--session[Scope to today]' \\
+              '--weekly[Scope to current week]' \\
+              '--monthly[Scope to last 30 days]' \\
+              '--json[Output as JSON]'
+          elif [[ $words[3] == "list" ]]; then
+            _arguments \\
+              '--provider[Filter by provider]:provider:(anthropic openai gemini)' \\
+              '--limit[Max records]:limit:'
+          fi
+          ;;
+        sync)
+          if [[ $CURRENT -eq 3 ]]; then
+            _describe 'source' '(claude-code:Sync from Claude Code JSONL files)'
+          else
+            _arguments \\
+              '--projects-dir[Claude Code projects directory]:dir:_directories' \\
+              '--dry-run[Print records without writing]'
+          fi
+          ;;
+        report)
+          _arguments \\
+            '--period[Period]:period:(daily weekly monthly)' \\
+            '--days[Custom number of days]:days:' \\
+            '--plain[Output without ANSI colors]'
+          ;;
+        check-budget)
+          _arguments \\
+            '--agent-id[Agent ID]:id:' \\
+            '--skip-quota[Skip token quota check]'
+          ;;
+        completion)
+          if [[ $CURRENT -eq 3 ]]; then
+            _describe 'shell' '(bash:Bash completion zsh:Zsh completion fish:Fish completion)'
+          fi
+          ;;
+      esac
+      ;;
+  esac
+}
+
+_agent_scheduler "$@"
+`;
+}
+
+function fishCompletion(): string {
+  return `# fish completion for agent-scheduler
+# Usage: agent-scheduler completion fish > ~/.config/fish/completions/agent-scheduler.fish
+
+# Disable default file completion
+complete -c agent-scheduler -f
+
+# ── Top-level commands ────────────────────────────────────────────────────────
+complete -c agent-scheduler -n "__fish_use_subcommand" -a init          -d "Initialize agent-scheduler"
+complete -c agent-scheduler -n "__fish_use_subcommand" -a status        -d "Show usage percentages against configured budgets"
+complete -c agent-scheduler -n "__fish_use_subcommand" -a budget        -d "Manage budgets"
+complete -c agent-scheduler -n "__fish_use_subcommand" -a usage         -d "Show token quota status"
+complete -c agent-scheduler -n "__fish_use_subcommand" -a check-budget  -d "Exit non-zero if budget exceeded"
+complete -c agent-scheduler -n "__fish_use_subcommand" -a sync          -d "Sync usage data from external sources"
+complete -c agent-scheduler -n "__fish_use_subcommand" -a report        -d "Human-readable spend report"
+complete -c agent-scheduler -n "__fish_use_subcommand" -a completion    -d "Generate shell completion script"
+
+# ── budget subcommands ────────────────────────────────────────────────────────
+complete -c agent-scheduler -n "__fish_seen_subcommand_from budget" -a set    -d "Create or update a named budget"
+complete -c agent-scheduler -n "__fish_seen_subcommand_from budget" -a delete -d "Delete a budget by id"
+complete -c agent-scheduler -n "__fish_seen_subcommand_from budget" -a reset  -d "Reset spend counter (non-destructive)"
+complete -c agent-scheduler -n "__fish_seen_subcommand_from budget" -a list   -d "List all configured budgets"
+
+# budget set options
+complete -c agent-scheduler -n "__fish_seen_subcommand_from budget; and __fish_seen_subcommand_from set" -l period    -d "Period" -a "daily weekly monthly"
+complete -c agent-scheduler -n "__fish_seen_subcommand_from budget; and __fish_seen_subcommand_from set" -l action    -d "Action" -a "alert block queue"
+complete -c agent-scheduler -n "__fish_seen_subcommand_from budget; and __fish_seen_subcommand_from set" -l threshold -d "Alert threshold (0-1)"
+
+# ── usage subcommands ─────────────────────────────────────────────────────────
+complete -c agent-scheduler -n "__fish_seen_subcommand_from usage" -a quota-json -d "Output current quota as JSON"
+complete -c agent-scheduler -n "__fish_seen_subcommand_from usage" -a breakdown  -d "Show per-model token breakdown"
+complete -c agent-scheduler -n "__fish_seen_subcommand_from usage" -a list       -d "List usage records"
+
+# usage breakdown options
+complete -c agent-scheduler -n "__fish_seen_subcommand_from usage; and __fish_seen_subcommand_from breakdown" -l session  -d "Scope to today"
+complete -c agent-scheduler -n "__fish_seen_subcommand_from usage; and __fish_seen_subcommand_from breakdown" -l weekly   -d "Scope to current week"
+complete -c agent-scheduler -n "__fish_seen_subcommand_from usage; and __fish_seen_subcommand_from breakdown" -l monthly  -d "Scope to last 30 days"
+complete -c agent-scheduler -n "__fish_seen_subcommand_from usage; and __fish_seen_subcommand_from breakdown" -l json     -d "Output as JSON"
+
+# usage list options
+complete -c agent-scheduler -n "__fish_seen_subcommand_from usage; and __fish_seen_subcommand_from list" -l provider -d "Filter by provider" -a "anthropic openai gemini"
+complete -c agent-scheduler -n "__fish_seen_subcommand_from usage; and __fish_seen_subcommand_from list" -l limit    -d "Max records to show"
+
+# ── sync ──────────────────────────────────────────────────────────────────────
+complete -c agent-scheduler -n "__fish_seen_subcommand_from sync" -a claude-code -d "Sync from Claude Code JSONL files"
+complete -c agent-scheduler -n "__fish_seen_subcommand_from sync" -l projects-dir -d "Claude Code projects directory"
+complete -c agent-scheduler -n "__fish_seen_subcommand_from sync" -l dry-run      -d "Print records without writing"
+
+# ── report ────────────────────────────────────────────────────────────────────
+complete -c agent-scheduler -n "__fish_seen_subcommand_from report" -l period -d "Period" -a "daily weekly monthly"
+complete -c agent-scheduler -n "__fish_seen_subcommand_from report" -l days   -d "Custom number of days"
+complete -c agent-scheduler -n "__fish_seen_subcommand_from report" -l plain  -d "Output without ANSI colors"
+
+# ── check-budget ──────────────────────────────────────────────────────────────
+complete -c agent-scheduler -n "__fish_seen_subcommand_from check-budget" -l agent-id   -d "Agent ID"
+complete -c agent-scheduler -n "__fish_seen_subcommand_from check-budget" -l skip-quota -d "Skip token quota check"
+
+# ── completion ────────────────────────────────────────────────────────────────
+complete -c agent-scheduler -n "__fish_seen_subcommand_from completion" -a bash -d "Bash completion"
+complete -c agent-scheduler -n "__fish_seen_subcommand_from completion" -a zsh  -d "Zsh completion"
+complete -c agent-scheduler -n "__fish_seen_subcommand_from completion" -a fish -d "Fish completion"
+`;
+}
