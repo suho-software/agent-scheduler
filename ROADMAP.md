@@ -42,7 +42,7 @@ This document outlines the planned direction for agent-scheduler. Priorities shi
 - [ ] VS Code multi-root workspace integration
   - Budget status in the status bar
   - Per-workspace spend breakdown
-- [ ] Web dashboard (optional local server: `agent-scheduler dashboard`)
+- [x] Web dashboard (optional local server: `agent-scheduler dashboard`)
 - [ ] SaaS tier: team-shared budget, multi-user dashboards, alerts via email/Slack
 - [ ] Webhook support for budget events (pause, alert, block)
 

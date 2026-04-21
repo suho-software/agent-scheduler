@@ -4,8 +4,10 @@ import chalk from 'chalk';
 import { createInterface } from 'node:readline/promises';
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, createReadStream } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createInterface as createLineInterface } from 'node:readline';
+import { execFile } from 'node:child_process';
 import { openDb, calcCostUsdWithCache, CLAUDE_PLAN_LIMITS, ClaudePlan, ModelBreakdownRow } from '@agent-scheduler/core';
 
 const CONFIG_PATH = join(homedir(), '.agent-scheduler.json');
@@ -850,6 +852,94 @@ Examples:
     }
   });
 
+// ─── dashboard ───────────────────────────────────────────────────────────────
+program
+  .command('dashboard')
+  .description('Launch local web dashboard (http://localhost:<port>)')
+  .option('--port <n>', 'Port to listen on', '3737')
+  .option('--no-open', 'Do not open browser automatically')
+  .action(async (opts) => {
+    const port = parseInt(opts.port, 10);
+
+    let express: typeof import('express');
+    try {
+      express = (await import('express')).default;
+    } catch {
+      console.error(chalk.red('\n  express is not installed. Run: npm i express\n'));
+      process.exit(1);
+    }
+
+    const config = loadConfig();
+    const db = openDb(config.dbPath);
+    const app = express();
+
+    app.get('/api/usage', (req: import('express').Request, res: import('express').Response) => {
+      const limit = parseInt((req.query['limit'] as string) ?? '500', 10);
+      const provider = req.query['provider'] as string | undefined;
+      res.json(db.listUsage({ limit, provider }));
+    });
+
+    app.get('/api/budgets', (_req: import('express').Request, res: import('express').Response) => {
+      res.json(db.listBudgets().map(b => ({ ...b, status: db.getBudgetStatus(b) })));
+    });
+
+    app.get('/api/summary', (_req: import('express').Request, res: import('express').Response) => {
+      const usage = db.listUsage({ limit: 10000 });
+      const today = new Date();
+      const todayStr = today.toISOString().slice(0, 10);
+
+      const dailyMap: Record<string, number> = {};
+      const providerMap: Record<string, number> = {};
+      for (const r of usage) {
+        const day = r.timestamp.toISOString().slice(0, 10);
+        dailyMap[day] = (dailyMap[day] ?? 0) + r.costUsd;
+        providerMap[r.provider] = (providerMap[r.provider] ?? 0) + r.costUsd;
+      }
+
+      res.json({
+        daily: Object.entries(dailyMap).sort(([a], [b]) => a.localeCompare(b)).slice(-30).map(([date, cost]) => ({ date, cost })),
+        byProvider: Object.entries(providerMap).map(([provider, cost]) => ({ provider, cost })),
+        todayCost: usage.filter(r => r.timestamp.toISOString().slice(0, 10) === todayStr).reduce((s, r) => s + r.costUsd, 0),
+        monthCost: usage.filter(r => r.timestamp.getFullYear() === today.getFullYear() && r.timestamp.getMonth() === today.getMonth()).reduce((s, r) => s + r.costUsd, 0),
+        totalRecords: usage.length,
+      });
+    });
+
+    // Serve pre-built dashboard static files — resolve relative to this file's location
+    const thisDir = dirname(fileURLToPath(import.meta.url));
+    const staticCandidates = [
+      join(thisDir, '..', '..', 'dashboard', 'dist'),  // monorepo: packages/cli/dist → packages/dashboard/dist
+      join(thisDir, 'dashboard-static'),                 // npm bundle
+    ];
+    const staticDir = staticCandidates.find(p => existsSync(p));
+
+    if (staticDir) {
+      const serveStatic = (await import('serve-static')).default;
+      app.use(serveStatic(staticDir));
+      app.get('*', (_req: import('express').Request, res: import('express').Response) => {
+        res.sendFile(join(staticDir, 'index.html'));
+      });
+    } else {
+      app.get('/', (_req: import('express').Request, res: import('express').Response) => {
+        res.send('<p>Dashboard static files not found. Run <code>pnpm build</code> in packages/dashboard.</p>');
+      });
+    }
+
+    app.listen(port, () => {
+      const url = `http://localhost:${port}`;
+      console.log(chalk.bold.cyan('\n  agent-scheduler dashboard\n'));
+      console.log(chalk.gray(`  Serving: ${staticDir ?? '(API only)'}`));
+      console.log(chalk.green(`  Open:    ${url}\n`));
+      console.log(chalk.gray('  Press Ctrl+C to stop.\n'));
+      if (opts.open !== false) {
+        const openCmd = process.platform === 'darwin' ? 'open' : 'xdg-open';
+        const openArgs = process.platform === 'win32' ? ['/c', 'start', url] : [url];
+        const openBin = process.platform === 'win32' ? 'cmd' : openCmd;
+        execFile(openBin, openArgs, () => {});
+      }
+    });
+  });
+
 program.parse();
 
 // ─── Completion script generators ────────────────────────────────────────────
@@ -866,7 +956,7 @@ _agent_scheduler_completions() {
   cword=$COMP_CWORD
   COMPREPLY=()
 
-  local top_cmds="init status budget usage check-budget sync report completion"
+  local top_cmds="init status budget usage check-budget sync report completion dashboard"
 
   if [[ $cword -eq 1 ]]; then
     COMPREPLY=($(compgen -W "$top_cmds" -- "$cur"))
@@ -1017,6 +1107,11 @@ _agent_scheduler() {
             _describe 'shell' '(bash:Bash completion zsh:Zsh completion fish:Fish completion)'
           fi
           ;;
+        dashboard)
+          _arguments \\
+            '--port[Port to listen on]:port:' \\
+            '--no-open[Do not open browser automatically]'
+          ;;
       esac
       ;;
   esac
@@ -1042,6 +1137,7 @@ complete -c agent-scheduler -n "__fish_use_subcommand" -a check-budget  -d "Exit
 complete -c agent-scheduler -n "__fish_use_subcommand" -a sync          -d "Sync usage data from external sources"
 complete -c agent-scheduler -n "__fish_use_subcommand" -a report        -d "Human-readable spend report"
 complete -c agent-scheduler -n "__fish_use_subcommand" -a completion    -d "Generate shell completion script"
+complete -c agent-scheduler -n "__fish_use_subcommand" -a dashboard     -d "Launch local web dashboard"
 
 # ── budget subcommands ────────────────────────────────────────────────────────
 complete -c agent-scheduler -n "__fish_seen_subcommand_from budget" -a set    -d "Create or update a named budget"
@@ -1087,5 +1183,9 @@ complete -c agent-scheduler -n "__fish_seen_subcommand_from check-budget" -l ski
 complete -c agent-scheduler -n "__fish_seen_subcommand_from completion" -a bash -d "Bash completion"
 complete -c agent-scheduler -n "__fish_seen_subcommand_from completion" -a zsh  -d "Zsh completion"
 complete -c agent-scheduler -n "__fish_seen_subcommand_from completion" -a fish -d "Fish completion"
+
+# ── dashboard ─────────────────────────────────────────────────────────────────
+complete -c agent-scheduler -n "__fish_seen_subcommand_from dashboard" -l port    -d "Port to listen on"
+complete -c agent-scheduler -n "__fish_seen_subcommand_from dashboard" -l no-open -d "Do not open browser automatically"
 `;
 }
