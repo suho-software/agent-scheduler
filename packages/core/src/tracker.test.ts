@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { wrapAnthropic, instrumentStream, wrapOpenAI, instrumentOpenAIStream } from './tracker.js';
+import { wrapAnthropic, instrumentStream, wrapOpenAI, instrumentOpenAIStream, wrapGeminiModel } from './tracker.js';
 import type { UsageRecord } from './types.js';
 
 type UsagePayload = Omit<UsageRecord, 'id' | 'timestamp'>;
@@ -343,5 +343,104 @@ describe('wrapOpenAI', () => {
     for await (const _ of stream) { /* consume */ }
 
     expect(capturedParams.stream_options?.include_usage).toBe(true);
+  });
+});
+
+// ─── wrapGeminiModel ──────────────────────────────────────────────────────────
+
+describe('wrapGeminiModel', () => {
+  function makeFakeGeminiModel(opts: {
+    promptTokens: number;
+    candidatesTokens: number;
+    streamChunkCount?: number;
+  }) {
+    const usageMetadata = {
+      promptTokenCount: opts.promptTokens,
+      candidatesTokenCount: opts.candidatesTokens,
+      totalTokenCount: opts.promptTokens + opts.candidatesTokens,
+    };
+
+    return {
+      generateContent: async (_req: any) => ({
+        response: { usageMetadata, text: () => 'hello' },
+      }),
+      generateContentStream: async (_req: any) => {
+        const count = opts.streamChunkCount ?? 3;
+        async function* gen() {
+          for (let i = 0; i < count; i++) {
+            yield { candidates: [{ content: { parts: [{ text: 'x' }] } }] };
+          }
+        }
+        const stream = gen();
+        // response Promise resolves after stream (simulates SDK behaviour)
+        const response = Promise.resolve({ usageMetadata, text: () => 'hello' });
+        return { stream, response };
+      },
+    };
+  }
+
+  it('records usage from generateContent response.usageMetadata', async () => {
+    const recorded: UsagePayload[] = [];
+    const model = makeFakeGeminiModel({ promptTokens: 600, candidatesTokens: 250 });
+    const wrapped = wrapGeminiModel(model, 'gemini-1.5-pro', (r) => recorded.push(r));
+
+    await wrapped.generateContent('hello');
+
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].provider).toBe('gemini');
+    expect(recorded[0].model).toBe('gemini-1.5-pro');
+    expect(recorded[0].inputTokens).toBe(600);
+    expect(recorded[0].outputTokens).toBe(250);
+    expect(recorded[0].cacheWriteTokens).toBe(0);
+    expect(recorded[0].costUsd).toBeGreaterThan(0);
+  });
+
+  it('records usage from generateContentStream after stream is consumed', async () => {
+    const recorded: UsagePayload[] = [];
+    const model = makeFakeGeminiModel({ promptTokens: 1000, candidatesTokens: 400 });
+    const wrapped = wrapGeminiModel(model, 'gemini-1.5-flash', (r) => recorded.push(r));
+
+    const result = await wrapped.generateContentStream('tell me a story');
+    expect(recorded).toHaveLength(0); // not yet consumed
+
+    const chunks: any[] = [];
+    for await (const chunk of result.stream) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks).toHaveLength(3);
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].provider).toBe('gemini');
+    expect(recorded[0].inputTokens).toBe(1000);
+    expect(recorded[0].outputTokens).toBe(400);
+  });
+
+  it('preserves response Promise on stream result', async () => {
+    const model = makeFakeGeminiModel({ promptTokens: 100, candidatesTokens: 50 });
+    const wrapped = wrapGeminiModel(model, 'gemini-1.5-pro', () => {});
+
+    const result = await wrapped.generateContentStream('hi');
+    const response = await result.response;
+    expect(response.usageMetadata.promptTokenCount).toBe(100);
+  });
+
+  it('fires onUsage exactly once per generateContent call', async () => {
+    const onUsage = vi.fn();
+    const model = makeFakeGeminiModel({ promptTokens: 100, candidatesTokens: 50 });
+    const wrapped = wrapGeminiModel(model, 'gemini-1.5-pro', onUsage);
+
+    await wrapped.generateContent('a');
+    await wrapped.generateContent('b');
+
+    expect(onUsage).toHaveBeenCalledTimes(2);
+  });
+
+  it('calls onBeforeRequest before each generateContent call', async () => {
+    const onBeforeRequest = vi.fn();
+    const model = makeFakeGeminiModel({ promptTokens: 100, candidatesTokens: 50 });
+    const wrapped = wrapGeminiModel(model, 'gemini-1.5-pro', () => {}, onBeforeRequest);
+
+    await wrapped.generateContent('x');
+    expect(onBeforeRequest).toHaveBeenCalledTimes(1);
   });
 });

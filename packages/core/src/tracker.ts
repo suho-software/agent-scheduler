@@ -1,4 +1,4 @@
-import { calcCostUsdWithCache, UsageRecord } from './types.js';
+import { calcCostUsd, calcCostUsdWithCache, UsageRecord } from './types.js';
 import type { AgentSchedulerDb } from './db.js';
 
 export type AnthropicUsage = {
@@ -196,6 +196,99 @@ export async function* instrumentOpenAIStream(
     cacheReadTokens,
     cacheWriteTokens: 0,
     costUsd: calcCostUsdWithCache(model, inputTokens, outputTokens, cacheReadTokens, 0),
+  });
+}
+
+// ─── Gemini ───────────────────────────────────────────────────────────────────
+
+/**
+ * Wraps a Gemini model instance (returned by `genai.getGenerativeModel(...)`) to
+ * intercept usage from `generateContent` and `generateContentStream` calls.
+ *
+ * Unlike Anthropic/OpenAI wrappers which wrap the top-level client, this wraps the
+ * **model** object because that's where Gemini exposes `generateContent`. Pass the
+ * model name explicitly since it's set at model-creation time, not on the call.
+ *
+ * Supports both standard and streaming calls:
+ * - Non-streaming (`generateContent`): usage is read from `result.response.usageMetadata`.
+ * - Streaming (`generateContentStream`): the `stream` property of the result is replaced
+ *   with an instrumented generator; usage is taken from the `response` Promise once
+ *   the stream is exhausted (the Promise resolves independently in the SDK).
+ */
+export function wrapGeminiModel<T extends {
+  generateContent: (...args: any[]) => any;
+  generateContentStream: (...args: any[]) => any;
+}>(
+  model: T,
+  modelName: string,
+  onUsage: (record: Omit<UsageRecord, 'id' | 'timestamp'>) => void,
+  onBeforeRequest?: () => void,
+): T {
+  const origGenerate = model.generateContent.bind(model);
+  const origStream = model.generateContentStream.bind(model);
+
+  model.generateContent = async (...args: any[]) => {
+    onBeforeRequest?.();
+    const result = await origGenerate(...args);
+    const usage = result.response?.usageMetadata ?? {};
+    const inputTokens: number = usage.promptTokenCount ?? 0;
+    const outputTokens: number = usage.candidatesTokenCount ?? 0;
+
+    onUsage({
+      provider: 'gemini',
+      model: modelName,
+      inputTokens,
+      outputTokens,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      costUsd: calcCostUsd(modelName, inputTokens, outputTokens),
+    });
+
+    return result;
+  };
+
+  model.generateContentStream = async (...args: any[]) => {
+    onBeforeRequest?.();
+    const streamResult = await origStream(...args);
+
+    // Replace the stream iterator with one that fires onUsage after exhaustion.
+    // The response Promise is left intact so the consumer can still await it.
+    return {
+      ...streamResult,
+      stream: instrumentGeminiStream(streamResult.stream, streamResult.response, modelName, onUsage),
+    };
+  };
+
+  return model;
+}
+
+/**
+ * Wraps the Gemini stream iterator to fire `onUsage` after all chunks are consumed,
+ * using `usageMetadata` from the already-in-flight `response` Promise.
+ */
+async function* instrumentGeminiStream(
+  stream: AsyncIterable<any>,
+  responseProm: Promise<any>,
+  modelName: string,
+  onUsage: (record: Omit<UsageRecord, 'id' | 'timestamp'>) => void,
+): AsyncGenerator<any> {
+  for await (const chunk of stream) {
+    yield chunk;
+  }
+
+  const response = await responseProm;
+  const usage = response?.usageMetadata ?? {};
+  const inputTokens: number = usage.promptTokenCount ?? 0;
+  const outputTokens: number = usage.candidatesTokenCount ?? 0;
+
+  onUsage({
+    provider: 'gemini',
+    model: modelName,
+    inputTokens,
+    outputTokens,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    costUsd: calcCostUsd(modelName, inputTokens, outputTokens),
   });
 }
 
