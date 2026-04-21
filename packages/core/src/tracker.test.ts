@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { wrapAnthropic, instrumentStream } from './tracker.js';
+import { wrapAnthropic, instrumentStream, wrapOpenAI, instrumentOpenAIStream } from './tracker.js';
 import type { UsageRecord } from './types.js';
 
 type UsagePayload = Omit<UsageRecord, 'id' | 'timestamp'>;
@@ -182,5 +182,166 @@ describe('wrapAnthropic — streaming', () => {
     expect(recorded).toHaveLength(1);
     expect(recorded[0].inputTokens).toBe(300);
     expect(recorded[0].outputTokens).toBe(150);
+  });
+});
+
+// ─── instrumentOpenAIStream (unit) ────────────────────────────────────────────
+
+describe('instrumentOpenAIStream', () => {
+  async function* makeOpenAIStream(
+    model: string,
+    promptTokens: number,
+    completionTokens: number,
+    cachedTokens = 0,
+  ): AsyncGenerator<any> {
+    // Content chunks (no usage yet)
+    yield { id: 'chatcmpl-1', model, choices: [{ delta: { content: 'Hello' } }], usage: null };
+    yield { id: 'chatcmpl-1', model, choices: [{ delta: { content: ' world' } }], usage: null };
+    // Final chunk carries usage when stream_options.include_usage = true
+    yield {
+      id: 'chatcmpl-1',
+      model,
+      choices: [{ delta: {}, finish_reason: 'stop' }],
+      usage: {
+        prompt_tokens: promptTokens,
+        completion_tokens: completionTokens,
+        total_tokens: promptTokens + completionTokens,
+        prompt_tokens_details: cachedTokens > 0 ? { cached_tokens: cachedTokens } : undefined,
+      },
+    };
+  }
+
+  it('yields all chunks unchanged', async () => {
+    const chunks: any[] = [];
+    for await (const c of instrumentOpenAIStream(makeOpenAIStream('gpt-4o', 100, 50), 'unknown', () => {})) {
+      chunks.push(c);
+    }
+    expect(chunks).toHaveLength(3);
+  });
+
+  it('records usage from final chunk after stream ends', async () => {
+    const recorded: UsagePayload[] = [];
+    for await (const _ of instrumentOpenAIStream(
+      makeOpenAIStream('gpt-4o', 1000, 500),
+      'unknown',
+      (r) => recorded.push(r),
+    )) { /* consume */ }
+
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].provider).toBe('openai');
+    expect(recorded[0].model).toBe('gpt-4o');
+    expect(recorded[0].inputTokens).toBe(1000);
+    expect(recorded[0].outputTokens).toBe(500);
+    expect(recorded[0].cacheWriteTokens).toBe(0); // OpenAI has no write cost
+    expect(recorded[0].costUsd).toBeGreaterThan(0);
+  });
+
+  it('captures cached_tokens from prompt_tokens_details', async () => {
+    const recorded: UsagePayload[] = [];
+    for await (const _ of instrumentOpenAIStream(
+      makeOpenAIStream('gpt-4o', 500, 200, 300),
+      'unknown',
+      (r) => recorded.push(r),
+    )) { /* consume */ }
+
+    expect(recorded[0].cacheReadTokens).toBe(300);
+  });
+
+  it('uses model from chunk (overrides fallback)', async () => {
+    const recorded: UsagePayload[] = [];
+    for await (const _ of instrumentOpenAIStream(
+      makeOpenAIStream('gpt-4o-mini', 100, 50),
+      'unknown-model',
+      (r) => recorded.push(r),
+    )) { /* consume */ }
+
+    expect(recorded[0].model).toBe('gpt-4o-mini');
+  });
+
+  it('fires onUsage exactly once', async () => {
+    const onUsage = vi.fn();
+    for await (const _ of instrumentOpenAIStream(makeOpenAIStream('gpt-4o', 100, 50), 'unknown', onUsage)) { /* consume */ }
+    expect(onUsage).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── wrapOpenAI ───────────────────────────────────────────────────────────────
+
+describe('wrapOpenAI', () => {
+  function makeFakeOpenAIClient(streamChunks: any[]) {
+    return {
+      chat: {
+        completions: {
+          create: async (params: any) => {
+            if (params.stream) {
+              async function* gen() { for (const c of streamChunks) yield c; }
+              return gen();
+            }
+            return {
+              model: params.model ?? 'gpt-4o',
+              usage: { prompt_tokens: 400, completion_tokens: 200, total_tokens: 600 },
+              choices: [{ message: { content: 'hi' }, finish_reason: 'stop' }],
+            };
+          },
+        },
+      },
+    };
+  }
+
+  const streamChunks = [
+    { model: 'gpt-4o', choices: [{ delta: { content: 'hi' } }], usage: null },
+    {
+      model: 'gpt-4o',
+      choices: [{ delta: {}, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 800, completion_tokens: 300, total_tokens: 1100 },
+    },
+  ];
+
+  it('non-streaming records usage from response.usage', async () => {
+    const recorded: UsagePayload[] = [];
+    const client = makeFakeOpenAIClient([]);
+    const wrapped = wrapOpenAI(client, (r) => recorded.push(r));
+
+    await wrapped.chat.completions.create({ model: 'gpt-4o', messages: [] });
+
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].provider).toBe('openai');
+    expect(recorded[0].inputTokens).toBe(400);
+    expect(recorded[0].outputTokens).toBe(200);
+    expect(recorded[0].costUsd).toBeGreaterThan(0);
+  });
+
+  it('streaming records usage after stream is consumed', async () => {
+    const recorded: UsagePayload[] = [];
+    const client = makeFakeOpenAIClient(streamChunks);
+    const wrapped = wrapOpenAI(client, (r) => recorded.push(r));
+
+    const stream = await wrapped.chat.completions.create({ model: 'gpt-4o', messages: [], stream: true });
+    expect(recorded).toHaveLength(0); // not yet consumed
+
+    for await (const _ of stream) { /* consume */ }
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].inputTokens).toBe(800);
+    expect(recorded[0].outputTokens).toBe(300);
+  });
+
+  it('injects stream_options.include_usage into streaming params', async () => {
+    let capturedParams: any;
+    const client = {
+      chat: {
+        completions: {
+          create: async (params: any) => {
+            capturedParams = params;
+            async function* gen() { yield { model: 'gpt-4o', choices: [], usage: { prompt_tokens: 1, completion_tokens: 1 } }; }
+            return gen();
+          },
+        },
+      },
+    };
+    const wrapped = wrapOpenAI(client, () => {});
+    const stream = await wrapped.chat.completions.create({ model: 'gpt-4o', messages: [], stream: true });
+    for await (const _ of stream) { /* consume */ }
+
+    expect(capturedParams.stream_options?.include_usage).toBe(true);
   });
 });

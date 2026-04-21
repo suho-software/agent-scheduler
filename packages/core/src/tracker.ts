@@ -106,6 +106,101 @@ export async function* instrumentStream(
   });
 }
 
+// ─── OpenAI ───────────────────────────────────────────────────────────────────
+
+/**
+ * Wraps an OpenAI SDK client (`openai.chat.completions.create`) to intercept
+ * usage from every response and record it locally.
+ *
+ * Supports both standard and streaming calls:
+ * - Non-streaming: usage is read from `response.usage` (prompt_tokens / completion_tokens).
+ * - Streaming: automatically injects `stream_options: { include_usage: true }` so the
+ *   final chunk carries usage, then accumulates it via `instrumentOpenAIStream`.
+ */
+export function wrapOpenAI<T extends { chat: { completions: { create: (...args: any[]) => any } } }>(
+  client: T,
+  onUsage: (record: Omit<UsageRecord, 'id' | 'timestamp'>) => void,
+  onBeforeRequest?: () => void,
+): T {
+  const originalCreate = client.chat.completions.create.bind(client.chat.completions);
+
+  client.chat.completions.create = async (...args: any[]) => {
+    onBeforeRequest?.();
+    const isStreaming = args[0]?.stream === true;
+
+    if (isStreaming) {
+      // Inject stream_options.include_usage so the API emits usage in the last chunk.
+      const params = { ...args[0], stream_options: { ...args[0]?.stream_options, include_usage: true } };
+      const stream = await originalCreate(params, ...args.slice(1));
+      return instrumentOpenAIStream(stream, args[0]?.model ?? 'unknown', onUsage);
+    }
+
+    const response = await originalCreate(...args);
+    const model: string = response.model ?? args[0]?.model ?? 'unknown';
+    const usage = response.usage ?? {};
+    const inputTokens: number = usage.prompt_tokens ?? 0;
+    const outputTokens: number = usage.completion_tokens ?? 0;
+    // OpenAI exposes cache hits in prompt_tokens_details.cached_tokens (no cache-write cost).
+    const cacheReadTokens: number = usage.prompt_tokens_details?.cached_tokens ?? 0;
+
+    onUsage({
+      provider: 'openai',
+      model,
+      inputTokens,
+      outputTokens,
+      cacheReadTokens,
+      cacheWriteTokens: 0,
+      costUsd: calcCostUsdWithCache(model, inputTokens, outputTokens, cacheReadTokens, 0),
+    });
+
+    return response;
+  };
+
+  return client;
+}
+
+/**
+ * Wraps an OpenAI streaming response (AsyncIterable of ChatCompletionChunk) to
+ * transparently pass all chunks through while collecting usage from the final
+ * chunk (which carries usage when `stream_options.include_usage` is set).
+ *
+ * Fires `onUsage` exactly once after the stream is exhausted.
+ */
+export async function* instrumentOpenAIStream(
+  stream: AsyncIterable<any>,
+  fallbackModel: string,
+  onUsage: (record: Omit<UsageRecord, 'id' | 'timestamp'>) => void,
+): AsyncGenerator<any> {
+  let model = fallbackModel;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cacheReadTokens = 0;
+
+  for await (const chunk of stream) {
+    yield chunk;
+
+    if (chunk.model) model = chunk.model;
+
+    if (chunk.usage) {
+      inputTokens = chunk.usage.prompt_tokens ?? 0;
+      outputTokens = chunk.usage.completion_tokens ?? 0;
+      cacheReadTokens = chunk.usage.prompt_tokens_details?.cached_tokens ?? 0;
+    }
+  }
+
+  onUsage({
+    provider: 'openai',
+    model,
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens: 0,
+    costUsd: calcCostUsdWithCache(model, inputTokens, outputTokens, cacheReadTokens, 0),
+  });
+}
+
+// ─── Convenience wrappers ─────────────────────────────────────────────────────
+
 /**
  * Convenience wrapper with optional DB-backed budget enforcement.
  *
