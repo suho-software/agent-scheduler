@@ -17,13 +17,13 @@ This document outlines the planned direction for agent-scheduler. Priorities shi
 - Gemini SDK wrapper (`wrapGeminiModel()`) — wraps `generateContent` + `generateContentStream`
 - Dual CJS+ESM build via tsup (Firebase Functions / Next.js compatible)
 - Human-readable spend report: `agent-scheduler report --period daily|weekly|monthly`
+- `budget reset <id>` — non-destructive spend counter reset via `reset_at` timestamp (schema v4)
 - Paperclip plugin (hook + skill)
 - GitHub Actions CI/release pipeline
 
 ### In progress / near-term
 
 - [ ] Fix issues surfaced by dogfooding (tracked under [`dogfood` label](https://github.com/suho-software/agent-scheduler/issues?q=label%3Adogfood))
-- [ ] `budget reset` CLI command (clear spend counter for a budget period)
 - [ ] Shell completions (bash, zsh, fish)
 
 ### Community contribution opportunities
