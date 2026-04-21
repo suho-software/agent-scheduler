@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { UsageRecord, Budget, BudgetStatus, TokenQuotaStatus, SessionStats, ClaudePlan, ModelBreakdownRow, CLAUDE_PLAN_LIMITS, CLAUDE_SESSION_LIMITS } from './types.js';
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 export function openDb(path: string = '.agent-scheduler.db'): AgentSchedulerDb {
   const db = new Database(path);
@@ -61,6 +61,12 @@ function migrate(db: Database.Database): void {
       ALTER TABLE usage_records ADD COLUMN cache_read_tokens  INTEGER NOT NULL DEFAULT 0;
       ALTER TABLE usage_records ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0;
     `);
+  }
+
+  if (version < 4) {
+    // Nullable TEXT column — stores ISO timestamp when budget was last manually reset.
+    // When set, getBudgetStatus uses MAX(period_start, reset_at) as the effective window start.
+    db.exec(`ALTER TABLE budgets ADD COLUMN reset_at TEXT;`);
   }
 
   db.pragma(`user_version = ${SCHEMA_VERSION}`);
@@ -139,14 +145,15 @@ export class AgentSchedulerDb {
   upsertBudget(budget: Omit<Budget, 'id'> & { id?: string }): Budget {
     const id = budget.id ?? randomUUID();
     this.db.prepare(`
-      INSERT INTO budgets (id, name, limit_usd, period, alert_threshold, action)
-      VALUES (@id, @name, @limitUsd, @period, @alertThreshold, @action)
+      INSERT INTO budgets (id, name, limit_usd, period, alert_threshold, action, reset_at)
+      VALUES (@id, @name, @limitUsd, @period, @alertThreshold, @action, @resetAt)
       ON CONFLICT(id) DO UPDATE SET
         name = excluded.name,
         limit_usd = excluded.limit_usd,
         period = excluded.period,
         alert_threshold = excluded.alert_threshold,
-        action = excluded.action
+        action = excluded.action,
+        reset_at = excluded.reset_at
     `).run({
       id,
       name: budget.name,
@@ -154,17 +161,37 @@ export class AgentSchedulerDb {
       period: budget.period,
       alertThreshold: budget.alertThreshold,
       action: budget.action,
+      resetAt: budget.resetAt?.toISOString() ?? null,
     });
     return { ...budget, id };
   }
 
+  /**
+   * Set a budget's reset_at to now, so getBudgetStatus only counts spend since
+   * this moment (within the current period). The reset is non-destructive — old
+   * records are preserved and the effective window simply moves forward.
+   *
+   * Returns true if the budget was found and updated.
+   */
+  resetBudget(id: string): boolean {
+    const result = this.db.prepare(
+      `UPDATE budgets SET reset_at = ? WHERE id = ?`
+    ).run(new Date().toISOString(), id);
+    return result.changes > 0;
+  }
+
   getBudgetStatus(budget: Budget): BudgetStatus {
     const { periodStart, periodEnd } = getPeriodBounds(budget.period);
+    // Effective window start: the later of the period boundary and the last manual reset.
+    const effectiveStart = budget.resetAt && budget.resetAt > periodStart
+      ? budget.resetAt
+      : periodStart;
+
     const row = this.db.prepare(`
       SELECT COALESCE(SUM(cost_usd), 0) AS spent
       FROM usage_records
       WHERE timestamp >= ? AND timestamp < ?
-    `).get(periodStart.toISOString(), periodEnd.toISOString()) as { spent: number };
+    `).get(effectiveStart.toISOString(), periodEnd.toISOString()) as { spent: number };
 
     const spentUsd = row.spent;
     return {
@@ -810,5 +837,6 @@ function rowToBudget(row: any): Budget {
     period: row.period,
     alertThreshold: row.alert_threshold,
     action: row.action,
+    resetAt: row.reset_at ? new Date(row.reset_at) : undefined,
   };
 }

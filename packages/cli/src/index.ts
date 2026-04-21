@@ -236,6 +236,23 @@ budgetCmd
   });
 
 budgetCmd
+  .command('reset <id>')
+  .description('Reset a budget spend counter to now (non-destructive — old records preserved)')
+  .action((id: string) => {
+    const config = loadConfig();
+    const db = openDb(config.dbPath);
+    const reset = db.resetBudget(id);
+    db.close();
+    if (reset) {
+      const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+      console.log(chalk.green(`\n  ✓ Budget '${id}' reset at ${now} UTC.`));
+      console.log(chalk.gray('    Spend will be counted from this moment within the current period.\n'));
+    } else {
+      console.log(chalk.yellow(`\n  Budget '${id}' not found.\n`));
+    }
+  });
+
+budgetCmd
   .command('list')
   .description('List all configured budgets')
   .action(() => {
@@ -255,6 +272,9 @@ budgetCmd
       console.log(`    Limit:     $${b.limitUsd}/${b.period}`);
       console.log(`    Threshold: ${(b.alertThreshold * 100).toFixed(0)}%`);
       console.log(`    Action:    ${b.action}`);
+      if (b.resetAt) {
+        console.log(chalk.gray(`    Reset at:  ${b.resetAt.toISOString().replace('T', ' ').slice(0, 19)} UTC`));
+      }
     }
     console.log();
   });

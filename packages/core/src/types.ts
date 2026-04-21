@@ -22,6 +22,8 @@ export interface Budget {
   period: 'daily' | 'weekly' | 'monthly';
   alertThreshold: number; // 0.8 = alert at 80%
   action: 'alert' | 'block' | 'queue';
+  /** When set, spend is counted from MAX(period_start, reset_at) — allows on-demand resets. */
+  resetAt?: Date;
 }
 
 export interface ScheduledTask {

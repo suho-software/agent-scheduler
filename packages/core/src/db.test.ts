@@ -212,6 +212,58 @@ describe('AgentSchedulerDb.upsertBudget / getBudgetStatus', () => {
   });
 });
 
+// ─── resetBudget ──────────────────────────────────────────────────────────────
+
+describe('AgentSchedulerDb.resetBudget', () => {
+  let db: AgentSchedulerDb;
+  beforeEach(() => { db = freshDb(); });
+  afterEach(() => db.close());
+
+  it('returns true for an existing budget and sets reset_at', () => {
+    db.upsertBudget({ id: 'b', name: 'b', limitUsd: 100, period: 'monthly', alertThreshold: 0.8, action: 'alert' });
+    const before = new Date();
+    const result = db.resetBudget('b');
+    expect(result).toBe(true);
+
+    const budgets = db.listBudgets();
+    expect(budgets[0].resetAt).toBeInstanceOf(Date);
+    expect(budgets[0].resetAt!.getTime()).toBeGreaterThanOrEqual(before.getTime());
+  });
+
+  it('returns false for a non-existent budget', () => {
+    expect(db.resetBudget('does-not-exist')).toBe(false);
+  });
+
+  it('getBudgetStatus excludes spend before reset_at', () => {
+    const budget = db.upsertBudget({ id: 'b', name: 'b', limitUsd: 100, period: 'monthly', alertThreshold: 0.8, action: 'alert' });
+
+    // Insert $30 spend BEFORE the reset
+    const beforeReset = new Date(Date.now() - 5000); // 5 seconds ago
+    (db as any)['db'].prepare(
+      `INSERT INTO usage_records (id, timestamp, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
+       VALUES (randomblob(16), ?, 'anthropic', 'claude-sonnet-4-6', 0, 0, 0, 0, 30)`
+    ).run(beforeReset.toISOString());
+
+    // Perform reset
+    db.resetBudget('b');
+
+    // Insert $10 spend AFTER the reset
+    db.insertUsage({ provider: 'anthropic', model: 'claude-sonnet-4-6', inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 10 });
+
+    // Budget status should only count post-reset spend
+    const [freshBudget] = db.listBudgets();
+    const status = db.getBudgetStatus(freshBudget);
+    expect(status.spentUsd).toBeCloseTo(10); // NOT 40
+  });
+
+  it('pre-reset spend counts normally when no reset has been done', () => {
+    const budget = db.upsertBudget({ id: 'b', name: 'b', limitUsd: 100, period: 'monthly', alertThreshold: 0.8, action: 'alert' });
+    db.insertUsage({ provider: 'anthropic', model: 'claude-sonnet-4-6', inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 50 });
+    const status = db.getBudgetStatus(budget);
+    expect(status.spentUsd).toBeCloseTo(50);
+  });
+});
+
 // ─── getTokenQuotaStatus ───────────────────────────────────────────────────────
 
 describe('AgentSchedulerDb.getTokenQuotaStatus', () => {
