@@ -18,6 +18,11 @@ export class BudgetExceededError extends Error {
 /**
  * Wraps an Anthropic SDK client to intercept usage from every response
  * and record it locally. Works by wrapping the `messages.create` method.
+ *
+ * Supports both standard (non-streaming) and streaming (`stream: true`) calls:
+ * - Non-streaming: usage is read from `response.usage` on the resolved Message.
+ * - Streaming: usage is accumulated from `message_start` (input tokens + cache)
+ *   and `message_delta` (output tokens) events, then recorded after the stream ends.
  */
 export function wrapAnthropic<T extends { messages: { create: (...args: any[]) => any } }>(
   client: T,
@@ -28,7 +33,13 @@ export function wrapAnthropic<T extends { messages: { create: (...args: any[]) =
 
   client.messages.create = async (...args: any[]) => {
     onBeforeRequest?.();
+    const isStreaming = args[0]?.stream === true;
     const response = await originalCreate(...args);
+
+    if (isStreaming) {
+      return instrumentStream(response, args[0]?.model ?? 'unknown', onUsage);
+    }
+
     const model: string = response.model ?? args[0]?.model ?? 'unknown';
     const usage: AnthropicUsage = response.usage ?? { input_tokens: 0, output_tokens: 0 };
     const cacheReadTokens = usage.cache_read_input_tokens ?? 0;
@@ -48,6 +59,51 @@ export function wrapAnthropic<T extends { messages: { create: (...args: any[]) =
   };
 
   return client;
+}
+
+/**
+ * Wraps an Anthropic stream (AsyncIterable of MessageStreamEvents) to
+ * transparently pass all events through while accumulating usage from
+ * `message_start` and `message_delta` events. Fires `onUsage` once the
+ * stream is exhausted.
+ *
+ * This is an async generator so it satisfies the `AsyncIterable` contract
+ * that the Anthropic SDK Stream class also satisfies.
+ */
+export async function* instrumentStream(
+  stream: AsyncIterable<any>,
+  fallbackModel: string,
+  onUsage: (record: Omit<UsageRecord, 'id' | 'timestamp'>) => void,
+): AsyncGenerator<any> {
+  let model = fallbackModel;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cacheReadTokens = 0;
+  let cacheWriteTokens = 0;
+
+  for await (const event of stream) {
+    yield event;
+
+    if (event.type === 'message_start' && event.message) {
+      model = event.message.model ?? model;
+      const u: AnthropicUsage = event.message.usage ?? {};
+      inputTokens = u.input_tokens ?? 0;
+      cacheReadTokens = u.cache_read_input_tokens ?? 0;
+      cacheWriteTokens = u.cache_creation_input_tokens ?? 0;
+    } else if (event.type === 'message_delta' && event.usage) {
+      outputTokens = event.usage.output_tokens ?? 0;
+    }
+  }
+
+  onUsage({
+    provider: 'anthropic',
+    model,
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    costUsd: calcCostUsdWithCache(model, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens),
+  });
 }
 
 /**
