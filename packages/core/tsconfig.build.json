@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "composite": false,
+    "declarationMap": false,
+    "ignoreDeprecations": "6.0"
+  },
+  "exclude": ["**/*.test.ts"]
+}

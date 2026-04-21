@@ -3,12 +3,18 @@
   "version": "0.1.0",
   "description": "AI usage tracking and scheduling engine",
   "type": "module",
-  "main": "./dist/index.js",
+  "main": "./dist/index.cjs",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
     }
   },
   "files": [
@@ -16,8 +22,8 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc",
-    "dev": "tsc --watch",
+    "build": "tsup",
+    "dev": "tsup --watch",
     "test": "vitest run"
   },
   "dependencies": {
@@ -25,6 +31,7 @@
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
+    "tsup": "^8.5.1",
     "typescript": "^6.0.3",
     "vitest": "^4.1.4"
   }
